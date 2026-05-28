@@ -2759,6 +2759,123 @@ class MXFP4Tests(unittest.TestCase):
     @settings(deadline=None)
     @given(
         G=st.sampled_from([1, 4, 16]),
+        M=st.sampled_from([1, 4, 32, 128]),
+        N=st.sampled_from([256, 1024, 4096]),
+        K=st.sampled_from([512, 2048]),
+    )
+    def test_mx8mx4_grouped_gemm_2d_3d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(
+            M,
+            G * M + 1,
+            M,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        xqs = []
+        x_scales = []
+        wqs = []
+        w_scales = []
+        for x, w in zip(XS, WS):
+            x_scale, xq = to_mxfp8(x)
+            x_scale = _to_blocked(
+                x_scale.view(torch.int8).reshape(x.shape[0], -1)
+            ).view(torch.uint8)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+
+            xqs.append(xq)
+            x_scales.append(x_scale)
+            wqs.append(wq.view(torch.float4_e2m1fn_x2))
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).contiguous()
+        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
+        wq = torch.stack(wqs, dim=0).contiguous()
+        w_scale = torch.stack(w_scales, dim=0).contiguous()
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
+
+        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
+
+    def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        G = 8
+        N = 1024
+        K = 2048
+        m_sizes_list = [0, 1, 4, 0, 32, 0, 8, 16]
+        offsets = torch.tensor(
+            m_sizes_list, dtype=torch.int32, device=self.device
+        ).cumsum(0, dtype=torch.int32)
+
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for M in m_sizes_list
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+
+        xqs = []
+        x_scales = []
+        wqs = []
+        w_scales = []
+        refs = []
+        for x, w in zip(XS, WS):
+            if x.numel() > 0:
+                x_scale, xq = to_mxfp8(x)
+                x_scale = _to_blocked(
+                    x_scale.view(torch.int8).reshape(x.shape[0], -1)
+                ).view(torch.uint8)
+                xqs.append(xq)
+                x_scales.append(x_scale)
+                refs.append(x @ w.t())
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            wqs.append(wq.view(torch.float4_e2m1fn_x2))
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).contiguous()
+        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
+        wq = torch.stack(wqs, dim=0).contiguous()
+        w_scale = torch.stack(w_scales, dim=0).contiguous()
+
+        out_bf16 = torch.cat(refs, dim=0).to(torch.bfloat16)
+        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
+
+        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
+
+    @settings(deadline=None)
+    @given(
+        G=st.sampled_from([1, 4, 16]),
         M=st.sampled_from([250, 500, 3500]),
         N=st.sampled_from([256, 1024, 6144]),
         K=st.sampled_from([2048, 3584]),
@@ -3045,6 +3162,94 @@ class MX8MX4Tests(unittest.TestCase):
 
         # Mixed MX8xMX4 has higher tolerance than MX4xMX4 due to mixed precision
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=1.0e-1, rtol=1.0e-1)
+
+
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+class MX8MX6Tests(unittest.TestCase):
+    """Tests for the mixed MX8 x MX6 CUTLASS GEMM kernel (mx8mx6bf16)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 64, 256]),
+        N=st.sampled_from([256, 1024]),
+        K=st.sampled_from([2048, 4096]),
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # Quantize A to MX8 with blocked scale layout
+        (a_scale_raw, aq) = to_mxfp8(A)
+        a_scale = _to_blocked(a_scale_raw.view(torch.int8).reshape(M, -1)).view(
+            torch.uint8
+        )
+
+        # Quantize B: use MX8 quantization for scale factors (E8M0 BS32),
+        # then create E2M3 weight data from the MX8 data.
+        # E2M3 is stored as 1 byte per element (6-bit value in uint8).
+        # We use the FP8 data masked to 6 bits as a proxy for E2M3.
+        (b_scale_raw, bq_fp8) = to_mxfp8(B)
+        b_scale = _to_blocked(b_scale_raw.view(torch.int8).reshape(N, -1)).view(
+            torch.uint8
+        )
+        bq = bq_fp8.view(torch.uint8) & 0x3F  # mask to 6 bits for E2M3 range
+
+        out_mx8mx6 = torch.ops.mslk.mx8mx6bf16(aq, bq, a_scale, b_scale)
+
+        # Smoke test: no NaN or Inf
+        self.assertFalse(out_mx8mx6.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out_mx8mx6.isinf().any().item(), "Output contains Inf")
+        # Output shape check
+        self.assertEqual(out_mx8mx6.shape, (M, N))
+
+
+@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if block-scaled GEMM is not supported")
+class MX6MX6Tests(unittest.TestCase):
+    """Tests for the symmetric MX6 x MX6 CUTLASS GEMM kernel (mx6mx6bf16)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    @settings(deadline=None)
+    @given(
+        M=st.sampled_from([1, 64, 256]),
+        N=st.sampled_from([256, 1024]),
+        K=st.sampled_from([2048, 4096]),
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        # Both A and B are random uint8 bytes packed at 6 bits/element. The
+        # mx6mx6bf16 kernel derives K = XQ.size(1) * 4 / 3 from packed bytes,
+        # so passing unpacked (M, K)-shape uint8 (e.g. via to_mxfp8(...) & 0x3F
+        # like the asymmetric mx8mx6 test) would silently corrupt K. No Python
+        # MX6 quantizer is wired up, so this test only validates dispatch +
+        # kernel execution (no NaN/Inf, correct shape/dtype).
+        A_bf16 = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        B_bf16 = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+
+        # MX6 packed weights for A and B: K elements at 6 bits each = K*6/8 bytes.
+        aq_6 = torch.randint(
+            0, 256, (M, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        bq_6 = torch.randint(
+            0, 256, (N, K * 6 // 8), dtype=torch.uint8, device=self.device
+        )
+        # Reuse MX4 block-scale layout (E8M0, block size 32) for both operands.
+        _, a_scale = triton_quantize_mx4_unpack(A_bf16)
+        _, b_scale = triton_quantize_mx4_unpack(B_bf16)
+
+        out_mx6mx6 = torch.ops.mslk.mx6mx6bf16(aq_6, bq_6, a_scale, b_scale)
+
+        self.assertFalse(out_mx6mx6.isnan().any().item(), "Output contains NaN")
+        self.assertFalse(out_mx6mx6.isinf().any().item(), "Output contains Inf")
+        self.assertEqual(out_mx6mx6.shape, torch.Size([M, N]))
+        self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ at::Tensor f4f4bf16_ultra_grouped_256_256_768_2_1_1(
     at::Tensor x_global_scale,
     at::Tensor w_global_scale,
     at::Tensor output) {
-  return f4f4bf16_ultra_grouped_impl<256, 256, 768, 2, 1, 1>(
+  return f4f4bf16_ultra_grouped_impl<true, 256, 256, 768, 2, 1, 1>(
       XQ,
       WQ,
       x_scale,
