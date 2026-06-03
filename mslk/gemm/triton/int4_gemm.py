@@ -302,12 +302,19 @@ def matmul_bf16i4_rowwise_batched(
 # ---------------------------------------------------------------------------
 # Register as ROCm implementations of mslk:: torch ops
 # ---------------------------------------------------------------------------
-# On ROCm, mslk::bf16i4bf16_rowwise and mslk::bf16i4bf16_rowwise_batched are
-# schema-only (no C++ CUTLASS impl). Importing this module registers the Triton
-# kernels above as the CUDA-dispatch implementations via torch.library.impl,
-# making torch.ops.mslk.bf16i4bf16_rowwise(...) call into Triton on AMD GPUs.
+# On ROCm, bf16i4 ops are schema-only (no C++ CUTLASS impl). Importing this
+# module registers Triton kernels as CUDA-dispatch implementations via
+# torch.library.impl, making torch.ops.mslk.*(...) call into Triton on AMD GPUs.
+#
+# bf16i4bf16_shuffled* ops: on ROCm the CUTLASS shuffle layout does not exist,
+# so we route them through the same rowwise kernels — no re-shuffling needed.
+# preshuffle_i4: CUTLASS SM90-only pre-processing; identity (no-op) on ROCm.
 
-if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
+
+def _register_rocm_ops() -> None:
+    if not (torch.version.hip is not None and hasattr(torch.ops, "mslk")):
+        return
+
     if hasattr(torch.ops.mslk, "bf16i4bf16_rowwise"):
 
         @torch.library.impl("mslk::bf16i4bf16_rowwise", "CUDA")
@@ -329,3 +336,42 @@ if torch.version.hip is not None and hasattr(torch.ops, "mslk"):
             w_zp: torch.Tensor,
         ) -> torch.Tensor:
             return matmul_bf16i4_rowwise_batched(X, W, w_scale, w_zp)
+
+    # bf16i4bf16_shuffled: routed to rowwise — shuffle is a CUDA/CUTLASS artefact
+    if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled"):
+
+        @torch.library.impl("mslk::bf16i4bf16_shuffled", "CUDA")
+        def _bf16i4bf16_shuffled_rocm(
+            X: torch.Tensor,
+            W: torch.Tensor,
+            w_scale_group: torch.Tensor,
+            w_zero_group: torch.Tensor,
+        ) -> torch.Tensor:
+            return matmul_bf16i4_rowwise(X, W, w_scale_group, w_zero_group)
+
+    if hasattr(torch.ops.mslk, "bf16i4bf16_shuffled_batched"):
+
+        @torch.library.impl("mslk::bf16i4bf16_shuffled_batched", "CUDA")
+        def _bf16i4bf16_shuffled_batched_rocm(
+            X: torch.Tensor,
+            W: torch.Tensor,
+            w_scale: torch.Tensor,
+            w_zp: torch.Tensor,
+        ) -> torch.Tensor:
+            return matmul_bf16i4_rowwise_batched(X, W, w_scale, w_zp)
+
+    # preshuffle_i4: identity on ROCm — weight is already in rowwise layout
+    if hasattr(torch.ops.mslk, "preshuffle_i4"):
+
+        @torch.library.impl("mslk::preshuffle_i4", "CUDA")
+        def _preshuffle_i4_rocm(
+            WQ: torch.Tensor,
+            w_scale: torch.Tensor,
+        ) -> tuple:
+            return WQ, w_scale
+
+
+try:
+    _register_rocm_ops()
+except Exception:
+    pass
