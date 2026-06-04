@@ -59,18 +59,240 @@ def _get_configs() -> List[Config]:
             for bk in [32, 64]:
                 for nw in [4, 8]:
                     for ns in [2, 3]:
-                        configs.append(
-                            Config(
-                                {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": bk},
-                                num_warps=nw,
-                                num_stages=ns,
+                        for waves in [0, 2, 4]:
+                            configs.append(
+                                Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "BLOCK_K": bk,
+                                        "waves_per_eu": waves,
+                                        "matrix_instr_nonkdim": 16,
+                                    },
+                                    num_warps=nw,
+                                    num_stages=ns,
+                                )
                             )
+    return configs
+
+
+def _zero_workspace(nargs) -> None:
+    """pre_hook: zero the split-K workspace before each autotune trial."""
+    nargs["workspace_ptr"].zero_()
+
+
+def _get_gemv_configs() -> List[Config]:
+    configs = []
+    for bn in [32, 64, 128]:
+        for bk in [32, 64, 128]:
+            for split_k in [4, 8, 16, 32]:
+                for waves in [0, 2, 4]:
+                    configs.append(
+                        Config(
+                            {
+                                "BLOCK_N": bn,
+                                "BLOCK_K": bk,
+                                "SPLIT_K": split_k,
+                                "waves_per_eu": waves,
+                            },
+                            num_warps=4,
+                            num_stages=2,
+                            pre_hook=_zero_workspace,
                         )
+                    )
+    return configs
+
+
+def _get_splitk_configs() -> List[Config]:
+    configs = []
+    for bm in [16, 32]:
+        for bn in [64, 128]:
+            for bk in [32, 64]:
+                for split_k in [2, 4, 8]:
+                    for nw in [4, 8]:
+                        for waves in [0, 2, 4]:
+                            configs.append(
+                                Config(
+                                    {
+                                        "BLOCK_M": bm,
+                                        "BLOCK_N": bn,
+                                        "BLOCK_K": bk,
+                                        "SPLIT_K": split_k,
+                                        "waves_per_eu": waves,
+                                        "matrix_instr_nonkdim": 16,
+                                    },
+                                    num_warps=nw,
+                                    num_stages=2,
+                                    pre_hook=_zero_workspace,
+                                )
+                            )
     return configs
 
 
 # ---------------------------------------------------------------------------
-# Core Triton kernel
+# GEMV kernel (M == 1) — tl.sum, no tl.dot, maximal split-K occupancy
+# ---------------------------------------------------------------------------
+
+
+@triton.autotune(
+    configs=_get_gemv_configs(),
+    key=["N", "K2", "group_size"],
+)
+@triton.jit
+def _bf16i4_gemv_kernel(
+    X_even_ptr,  # [1, K//2]  bfloat16
+    X_odd_ptr,  # [1, K//2]  bfloat16
+    W_ptr,  # [N, K//2]  int8 packed
+    workspace_ptr,  # [SPLIT_K, N]  float32  (pre-allocated by caller)
+    scale_ptr,  # [num_groups, N]
+    zero_ptr,  # [num_groups, N]
+    N,
+    K2,
+    group_size,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_sg,
+    stride_sn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+) -> None:
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)  # K partition index
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    k2_steps = tl.cdiv(K2, SPLIT_K * BLOCK_K)
+    for step in tl.range(0, k2_steps):
+        k2_start = pid_k * k2_steps * BLOCK_K + step * BLOCK_K
+        offs_k2 = k2_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k2 < K2
+
+        # activation row vectors [BLOCK_K]
+        x_even = tl.load(
+            X_even_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
+        ).to(tl.bfloat16)
+        x_odd = tl.load(
+            X_odd_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
+        ).to(tl.bfloat16)
+
+        # weight tile [BLOCK_N, BLOCK_K]
+        wk_mask = n_mask[:, None] & k_mask[None, :]
+        w_q = tl.load(
+            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
+            mask=wk_mask,
+            other=0,
+        ).to(tl.int32)
+
+        w_lo = w_q & 0x0F
+        w_hi = (w_q >> 4) & 0x0F
+
+        group_idx = (k2_start * 2) // group_size
+        s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
+        z = tl.load(zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
+
+        # dequant: [BLOCK_N, BLOCK_K] float32
+        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
+        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
+
+        # element-wise multiply and sum (no tl.dot / no MFMA)
+        acc += tl.sum(w_lo_dq * x_even[None, :].to(tl.float32), axis=1)
+        acc += tl.sum(w_hi_dq * x_odd[None, :].to(tl.float32), axis=1)
+
+    # each pid_k owns a unique row in [SPLIT_K, N] workspace — no atomics needed
+    tl.store(workspace_ptr + pid_k * N + offs_n, acc, mask=n_mask)
+
+
+# ---------------------------------------------------------------------------
+# Split-K GEMM kernel (1 < M <= _SPLITK_THRESH) — tl.dot, split-K workspace
+# ---------------------------------------------------------------------------
+
+
+@triton.autotune(
+    configs=_get_splitk_configs(),
+    key=["M", "N", "K2", "group_size"],
+)
+@triton.jit
+def _bf16i4_splitk_kernel(
+    X_even_ptr,  # [M, K//2]  bfloat16
+    X_odd_ptr,  # [M, K//2]  bfloat16
+    W_ptr,  # [N, K//2]  int8 packed
+    workspace_ptr,  # [SPLIT_K, M, N]  float32
+    scale_ptr,  # [num_groups, N]
+    zero_ptr,  # [num_groups, N]
+    M,
+    N,
+    K2,
+    group_size,
+    stride_xm,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_sg,
+    stride_sn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+) -> None:
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)  # K partition index
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    k2_steps = tl.cdiv(K2, SPLIT_K * BLOCK_K)
+    for step in tl.range(0, k2_steps):
+        k2_start = pid_k * k2_steps * BLOCK_K + step * BLOCK_K
+        offs_k2 = k2_start + tl.arange(0, BLOCK_K)
+
+        xk_mask = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
+        x_even = tl.load(
+            X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
+            mask=xk_mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+        x_odd = tl.load(
+            X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
+            mask=xk_mask,
+            other=0.0,
+        ).to(tl.bfloat16)
+
+        wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
+        w_q = tl.load(
+            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
+            mask=wk_mask,
+            other=0,
+        ).to(tl.int32)
+
+        w_lo = w_q & 0x0F
+        w_hi = (w_q >> 4) & 0x0F
+
+        group_idx = (k2_start * 2) // group_size
+        s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
+        z = tl.load(zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
+
+        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
+        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
+
+        acc = tl.dot(x_even, tl.trans(w_lo_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
+        acc = tl.dot(x_odd, tl.trans(w_hi_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
+
+    # write partial result to [SPLIT_K, M, N] workspace — each pid_k owns a unique slice
+    ws_base = pid_k * M * N + offs_m[:, None] * N + offs_n[None, :]
+    ws_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(workspace_ptr + ws_base, acc, mask=ws_mask)
+
+
+# ---------------------------------------------------------------------------
+# Core Triton kernel (M > _SPLITK_THRESH)
 # ---------------------------------------------------------------------------
 
 
@@ -189,6 +411,9 @@ def _bf16i4_rowwise_kernel(
 # Python wrappers
 # ---------------------------------------------------------------------------
 
+# M boundary below which split-K GEMM is used; GEMV is used when M==1.
+_SPLITK_THRESH: int = 128
+
 
 def matmul_bf16i4_rowwise(
     X: torch.Tensor,
@@ -198,6 +423,11 @@ def matmul_bf16i4_rowwise(
 ) -> torch.Tensor:
     """
     BF16 activation x INT4 weight GEMM with per-group rowwise dequantisation.
+
+    Dispatches to three kernels based on M:
+      M == 1          : GEMV (tl.sum, no tl.dot, maximal split-K occupancy)
+      1 < M <= 128    : split-K GEMM (two tl.dot per tile, split-K workspace)
+      M > 128         : standard GEMM (unchanged, best for compute-bound regime)
 
     Args:
         X             : [..., K]          bfloat16 activations
@@ -236,33 +466,103 @@ def matmul_bf16i4_rowwise(
     x_even = X_2d[:, 0::2].contiguous()  # [M, K//2]
     x_odd = X_2d[:, 1::2].contiguous()  # [M, K//2]
 
-    Y = torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
+    if M == 1:
+        # GEMV path: tl.sum, no tl.dot.  Workspace [SPLIT_K, N] reduced on CPU.
+        # SPLIT_K is a constexpr chosen by autotune; we allocate for the max we
+        # support (32) and slice after the kernel writes its actual SPLIT_K rows.
+        # pre_hook zeros the workspace before each autotune trial and before
+        # the winning config's final run, so all MAX_SPLIT_K rows are clean.
+        _MAX_SPLIT_K = 32
+        workspace = torch.empty((_MAX_SPLIT_K, N), dtype=torch.float32, device=X.device)
 
-    grid = lambda meta: (  # noqa: E731
-        triton.cdiv(M, meta["BLOCK_M"]),
-        triton.cdiv(N, meta["BLOCK_N"]),
-    )
-    _bf16i4_rowwise_kernel[grid](
-        x_even,
-        x_odd,
-        W,
-        Y,
-        w_scale_group,
-        w_zero_group,
-        M,
-        N,
-        K2,
-        group_size,
-        x_even.stride(0),
-        x_even.stride(1),
-        W.stride(0),
-        W.stride(1),
-        Y.stride(0),
-        Y.stride(1),
-        w_scale_group.stride(0),
-        w_scale_group.stride(1),
-    )
-    return Y.reshape(*leading, N)
+        def grid_gemv(meta):
+            return (triton.cdiv(N, meta["BLOCK_N"]), meta["SPLIT_K"])
+
+        _bf16i4_gemv_kernel[grid_gemv](
+            x_even[0],  # [K//2] — row vector
+            x_odd[0],
+            W,
+            workspace,
+            w_scale_group,
+            w_zero_group,
+            N,
+            K2,
+            group_size,
+            x_even.stride(1),
+            W.stride(0),
+            W.stride(1),
+            w_scale_group.stride(0),
+            w_scale_group.stride(1),
+        )
+        # pre_hook zeroed all rows before the winning run; only [:SPLIT_K] rows
+        # were written, the rest are 0 → sum all MAX_SPLIT_K rows safely.
+        Y = workspace.sum(dim=0).to(torch.bfloat16)
+        return Y.reshape(*leading, N)
+
+    elif M <= _SPLITK_THRESH:
+        # Split-K GEMM path: two tl.dot per tile, workspace [SPLIT_K, M, N].
+        # pre_hook zeros workspace before each autotune trial, so all rows are
+        # clean after the winning config's final run.
+        _MAX_SPLIT_K = 8
+        workspace = torch.empty((_MAX_SPLIT_K, M, N), dtype=torch.float32, device=X.device)
+
+        def grid_splitk(meta):
+            return (
+                triton.cdiv(M, meta["BLOCK_M"]),
+                triton.cdiv(N, meta["BLOCK_N"]),
+                meta["SPLIT_K"],
+            )
+
+        _bf16i4_splitk_kernel[grid_splitk](
+            x_even,
+            x_odd,
+            W,
+            workspace,
+            w_scale_group,
+            w_zero_group,
+            M,
+            N,
+            K2,
+            group_size,
+            x_even.stride(0),
+            x_even.stride(1),
+            W.stride(0),
+            W.stride(1),
+            w_scale_group.stride(0),
+            w_scale_group.stride(1),
+        )
+        Y = workspace.sum(dim=0).to(torch.bfloat16)
+        return Y.reshape(*leading, N)
+
+    else:
+        # Standard GEMM path (M > _SPLITK_THRESH).
+        Y = torch.empty((M, N), dtype=torch.bfloat16, device=X.device)
+
+        grid = lambda meta: (  # noqa: E731
+            triton.cdiv(M, meta["BLOCK_M"]),
+            triton.cdiv(N, meta["BLOCK_N"]),
+        )
+        _bf16i4_rowwise_kernel[grid](
+            x_even,
+            x_odd,
+            W,
+            Y,
+            w_scale_group,
+            w_zero_group,
+            M,
+            N,
+            K2,
+            group_size,
+            x_even.stride(0),
+            x_even.stride(1),
+            W.stride(0),
+            W.stride(1),
+            Y.stride(0),
+            Y.stride(1),
+            w_scale_group.stride(0),
+            w_scale_group.stride(1),
+        )
+        return Y.reshape(*leading, N)
 
 
 def matmul_bf16i4_rowwise_batched(

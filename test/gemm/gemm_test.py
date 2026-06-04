@@ -1552,6 +1552,37 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         y_direct = self.matmul_rowwise(x, wq, w_scale, w_zp)
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
+    @parameterized.expand(
+        [
+            (1, 4096, 4096, 128),
+            (64, 4096, 4096, 128),
+            (64, 4096, 11008, 128),
+            (512, 4096, 4096, 128),
+        ]
+    )
+    def test_dispatch_path_consistency(
+        self,
+        M: int,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        """
+        Verifies that the GEMV (M=1), split-K GEMM (M=64), and standard GEMM
+        (M=512) dispatch paths all produce results close to the float32 reference.
+        """
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        wq, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq).contiguous().to(device=self.device)
+        w_scale = w_scale.contiguous().to(device=self.device)
+        w_zp = w_zp.contiguous().to(device=self.device)
+
+        y_dispatch = self.matmul_rowwise(x, wq, w_scale, w_zp)
+        y_ref = (x.float() @ w.float().T).to(torch.bfloat16)
+        torch.testing.assert_close(y_dispatch, y_ref, atol=1.0e-1, rtol=8.0e-2)
+
 
 @unittest.skipIf(torch.version.hip is None, "ROCm-only: BF16xINT4 Triton grouped GEMM")
 class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
