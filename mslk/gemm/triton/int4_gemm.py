@@ -175,10 +175,10 @@ def _bf16i4_gemv_kernel(
         # activation row vectors [BLOCK_K]
         x_even = tl.load(
             X_even_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
         x_odd = tl.load(
             X_odd_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
 
         # weight tile [BLOCK_N, BLOCK_K]
         wk_mask = n_mask[:, None] & k_mask[None, :]
@@ -188,20 +188,22 @@ def _bf16i4_gemv_kernel(
             other=0,
         ).to(tl.int32)
 
-        w_lo = w_q & 0x0F
-        w_hi = (w_q >> 4) & 0x0F
+        # unpack nibbles and sign-extend
+        q_lo = ((w_q & 0x0F) ^ 8) - 8  # [BLOCK_N, BLOCK_K] int32
+        q_hi = (((w_q >> 4) & 0x0F) ^ 8) - 8
 
-        group_idx = (k2_start * 2) // group_size
+        # element-wise multiply then sum (no tl.dot: GEMV path, no MFMA)
+        tile_lo = tl.sum(q_lo.to(tl.float32) * x_even[None, :], axis=1)  # [BLOCK_N]
+        tile_hi = tl.sum(q_hi.to(tl.float32) * x_odd[None, :], axis=1)
+
+        # scale-after-dot: apply scale and zero-point to tile partial sums.
+        # Clamp group_idx to the last valid group: when k2_start >= K2 all loads are
+        # masked to 0, so the contribution is zero regardless of which group we load.
+        group_idx = tl.minimum((k2_start * 2) // group_size, K2 * 2 // group_size - 1)
         s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
-        z = tl.load(zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
-
-        # dequant: [BLOCK_N, BLOCK_K] float32
-        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
-        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
-
-        # element-wise multiply and sum (no tl.dot / no MFMA)
-        acc += tl.sum(w_lo_dq * x_even[None, :].to(tl.float32), axis=1)
-        acc += tl.sum(w_hi_dq * x_odd[None, :].to(tl.float32), axis=1)
+        z = tl.load(zero_ptr  + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
+        x_sum_tile = tl.sum(x_even + x_odd)  # scalar: activation sum for this tile
+        acc += (tile_lo + tile_hi) * s + z * x_sum_tile
 
     # each pid_k owns a unique row in [SPLIT_K, N] workspace — no atomics needed
     tl.store(workspace_ptr + pid_k * N + offs_n, acc, mask=n_mask)
@@ -258,12 +260,12 @@ def _bf16i4_splitk_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        ).to(tl.float32)
 
         wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
         w_q = tl.load(
@@ -272,18 +274,22 @@ def _bf16i4_splitk_kernel(
             other=0,
         ).to(tl.int32)
 
-        w_lo = w_q & 0x0F
-        w_hi = (w_q >> 4) & 0x0F
+        # unpack and sign-extend; cast to bf16 for tl.dot
+        q_lo = (((w_q & 0x0F) ^ 8) - 8).to(tl.bfloat16)  # [BLOCK_N, BLOCK_K]
+        q_hi = ((((w_q >> 4) & 0x0F) ^ 8) - 8).to(tl.bfloat16)
 
-        group_idx = (k2_start * 2) // group_size
+        # scale-after-dot: compute raw dot products, then apply scale/zero to tile partial
+        tile_partial = tl.dot(x_even.to(tl.bfloat16), tl.trans(q_lo), out_dtype=tl.float32)
+        tile_partial = tl.dot(x_odd.to(tl.bfloat16), tl.trans(q_hi), tile_partial, out_dtype=tl.float32)
+
+        group_idx = tl.minimum((k2_start * 2) // group_size, K2 * 2 // group_size - 1)
         s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
-        z = tl.load(zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
+        z = tl.load(zero_ptr  + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
 
-        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
-        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s[:, None] + z[:, None]
+        # x_sum_tile: row sums of activations for this tile [BLOCK_M]
+        x_sum_tile = (x_even + x_odd).sum(axis=1)
 
-        acc = tl.dot(x_even, tl.trans(w_lo_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
-        acc = tl.dot(x_odd, tl.trans(w_hi_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32)
+        acc += tile_partial * s[None, :] + z[None, :] * x_sum_tile[:, None]
 
     # write partial result to [SPLIT_K, M, N] workspace — each pid_k owns a unique slice
     ws_base = pid_k * M * N + offs_m[:, None] * N + offs_n[None, :]
@@ -365,13 +371,10 @@ def _bf16i4_rowwise_kernel(
         ).to(tl.int32)
 
         # ---- unpack nibbles ----
-        # lo nibble (bits 0-3) -> even K weight values
-        # hi nibble (bits 4-7) -> odd  K weight values
         w_lo = w_q & 0x0F  # [BLOCK_N, BLOCK_K]
         w_hi = (w_q >> 4) & 0x0F  # [BLOCK_N, BLOCK_K]
 
         # ---- per-group scale and zero ----
-        # k2_start indexes K//2; the corresponding full-K position is 2*k2_start.
         group_idx = (k2_start * 2) // group_size
         s = tl.load(
             scale_ptr + group_idx * stride_sg + offs_n * stride_sn,
@@ -389,8 +392,6 @@ def _bf16i4_rowwise_kernel(
         w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s_col + z_col  # [BLOCK_N, BLOCK_K]
 
         # ---- two dot products, no interleave, no LDS ----
-        # x_even [BLOCK_M, BLOCK_K] @ w_lo_dq.T [BLOCK_K, BLOCK_N]  (even K)
-        # x_odd  [BLOCK_M, BLOCK_K] @ w_hi_dq.T [BLOCK_K, BLOCK_N]  (odd  K)
         acc = tl.dot(
             x_even, tl.trans(w_lo_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32
         )
