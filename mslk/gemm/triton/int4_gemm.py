@@ -42,7 +42,6 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from triton import Config  # @manual
 
-
 # ---------------------------------------------------------------------------
 # Autotuning configs
 # ---------------------------------------------------------------------------
@@ -57,7 +56,7 @@ def _get_configs() -> List[Config]:
             # group_size // 2 (so 2*BLOCK_K divides group_size).  With the
             # common group_size=128, BLOCK_K <= 64.
             for bk in [32, 64]:
-                for nw in [4, 8]:
+                for nw in [2, 4, 8]:
                     for ns in [2, 3]:
                         for waves in [0, 2, 4]:
                             configs.append(
@@ -85,7 +84,7 @@ def _get_gemv_configs() -> List[Config]:
     configs = []
     for bn in [32, 64, 128]:
         for bk in [32, 64, 128]:
-            for split_k in [4, 8, 16, 32]:
+            for split_k in [4, 8, 16, 32, 64]:
                 for waves in [0, 2, 4]:
                     configs.append(
                         Config(
@@ -157,6 +156,7 @@ def _bf16i4_gemv_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ) -> None:
     pid_n = tl.program_id(0)
     pid_k = tl.program_id(1)  # K partition index
@@ -170,18 +170,25 @@ def _bf16i4_gemv_kernel(
     for step in tl.range(0, k2_steps):
         k2_start = pid_k * k2_steps * BLOCK_K + step * BLOCK_K
         offs_k2 = k2_start + tl.arange(0, BLOCK_K)
-        k_mask = offs_k2 < K2
 
         # activation row vectors [BLOCK_K]
-        x_even = tl.load(
-            X_even_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
-        ).to(tl.float32)
-        x_odd = tl.load(
-            X_odd_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
-        ).to(tl.float32)
+        if EVEN_K:
+            x_even = tl.load(X_even_ptr + offs_k2 * stride_xk).to(tl.float32)
+            x_odd = tl.load(X_odd_ptr + offs_k2 * stride_xk).to(tl.float32)
+        else:
+            k_mask = offs_k2 < K2
+            x_even = tl.load(
+                X_even_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
+            ).to(tl.float32)
+            x_odd = tl.load(X_odd_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0).to(
+                tl.float32
+            )
 
         # weight tile [BLOCK_N, BLOCK_K]
-        wk_mask = n_mask[:, None] & k_mask[None, :]
+        if EVEN_K:
+            wk_mask = n_mask[:, None]
+        else:
+            wk_mask = n_mask[:, None] & k_mask[None, :]
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -197,11 +204,13 @@ def _bf16i4_gemv_kernel(
         tile_hi = tl.sum(q_hi.to(tl.float32) * x_odd[None, :], axis=1)
 
         # scale-after-dot: apply scale and zero-point to tile partial sums.
-        # Clamp group_idx to the last valid group: when k2_start >= K2 all loads are
-        # masked to 0, so the contribution is zero regardless of which group we load.
         group_idx = tl.minimum((k2_start * 2) // group_size, K2 * 2 // group_size - 1)
-        s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
-        z = tl.load(zero_ptr  + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask).to(tl.float32)
+        s = tl.load(
+            scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
+        z = tl.load(
+            zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
         x_sum_tile = tl.sum(x_even + x_odd)  # scalar: activation sum for this tile
         acc += (tile_lo + tile_hi) * s + z * x_sum_tile
 
@@ -240,6 +249,7 @@ def _bf16i4_splitk_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SPLIT_K: tl.constexpr,
+    EVEN_K: tl.constexpr,
 ) -> None:
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -247,6 +257,8 @@ def _bf16i4_splitk_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -255,7 +267,13 @@ def _bf16i4_splitk_kernel(
         k2_start = pid_k * k2_steps * BLOCK_K + step * BLOCK_K
         offs_k2 = k2_start + tl.arange(0, BLOCK_K)
 
-        xk_mask = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
+        if EVEN_K:
+            xk_mask = m_mask[:, None]
+            wk_mask = n_mask[:, None]
+        else:
+            xk_mask = m_mask[:, None] & (offs_k2[None, :] < K2)
+            wk_mask = n_mask[:, None] & (offs_k2[None, :] < K2)
+
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
@@ -267,7 +285,6 @@ def _bf16i4_splitk_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -275,25 +292,31 @@ def _bf16i4_splitk_kernel(
         ).to(tl.int32)
 
         # unpack and sign-extend; cast to bf16 for tl.dot
-        q_lo = (((w_q & 0x0F) ^ 8) - 8).to(tl.bfloat16)  # [BLOCK_N, BLOCK_K]
+        q_lo = (((w_q & 0x0F) ^ 8) - 8).to(tl.bfloat16)
         q_hi = ((((w_q >> 4) & 0x0F) ^ 8) - 8).to(tl.bfloat16)
 
         # scale-after-dot: compute raw dot products, then apply scale/zero to tile partial
-        tile_partial = tl.dot(x_even.to(tl.bfloat16), tl.trans(q_lo), out_dtype=tl.float32)
-        tile_partial = tl.dot(x_odd.to(tl.bfloat16), tl.trans(q_hi), tile_partial, out_dtype=tl.float32)
+        tile_partial = tl.dot(
+            x_even.to(tl.bfloat16), tl.trans(q_lo), out_dtype=tl.float32
+        )
+        tile_partial = tl.dot(
+            x_odd.to(tl.bfloat16), tl.trans(q_hi), tile_partial, out_dtype=tl.float32
+        )
 
         group_idx = tl.minimum((k2_start * 2) // group_size, K2 * 2 // group_size - 1)
-        s = tl.load(scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
-        z = tl.load(zero_ptr  + group_idx * stride_sg + offs_n * stride_sn, mask=offs_n < N).to(tl.float32)
+        s = tl.load(
+            scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
+        z = tl.load(
+            zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
 
-        # x_sum_tile: row sums of activations for this tile [BLOCK_M]
         x_sum_tile = (x_even + x_odd).sum(axis=1)
-
         acc += tile_partial * s[None, :] + z[None, :] * x_sum_tile[:, None]
 
     # write partial result to [SPLIT_K, M, N] workspace — each pid_k owns a unique slice
     ws_base = pid_k * M * N + offs_m[:, None] * N + offs_n[None, :]
-    ws_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    ws_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(workspace_ptr + ws_base, acc, mask=ws_mask)
 
 
@@ -326,6 +349,7 @@ def _bf16i4_rowwise_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # tile size over K2; inner-dot K for each tl.dot
+    EVEN_K: tl.constexpr,  # True when K2 % BLOCK_K == 0 (skip K-boundary masks)
 ) -> None:
     """
     Computes Y[M, N] = X[M, K] @ dequant(W)[K, N].
@@ -342,6 +366,8 @@ def _bf16i4_rowwise_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
@@ -350,7 +376,10 @@ def _bf16i4_rowwise_kernel(
         offs_k2 = k2_start + tl.arange(0, BLOCK_K)
 
         # ---- activation tiles [BLOCK_M, BLOCK_K] — fully coalesced ----
-        xk_mask = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
+        if EVEN_K:
+            xk_mask = m_mask[:, None]
+        else:
+            xk_mask = m_mask[:, None] & (offs_k2[None, :] < K2)
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
@@ -363,7 +392,10 @@ def _bf16i4_rowwise_kernel(
         ).to(tl.bfloat16)
 
         # ---- packed weight tile [BLOCK_N, BLOCK_K] ----
-        wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
+        if EVEN_K:
+            wk_mask = n_mask[:, None]
+        else:
+            wk_mask = n_mask[:, None] & (offs_k2[None, :] < K2)
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -378,11 +410,11 @@ def _bf16i4_rowwise_kernel(
         group_idx = (k2_start * 2) // group_size
         s = tl.load(
             scale_ptr + group_idx * stride_sg + offs_n * stride_sn,
-            mask=offs_n < N,
+            mask=n_mask,
         ).to(tl.float32)
         z = tl.load(
             zero_ptr + group_idx * stride_sg + offs_n * stride_sn,
-            mask=offs_n < N,
+            mask=n_mask,
         ).to(tl.float32)
         s_col = s[:, None]
         z_col = z[:, None]
@@ -400,7 +432,7 @@ def _bf16i4_rowwise_kernel(
         )
 
     # ---- store output ----
-    y_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    y_mask = m_mask[:, None] & n_mask[None, :]
     tl.store(
         Y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn,
         acc.to(tl.bfloat16),
@@ -447,12 +479,14 @@ def matmul_bf16i4_rowwise(
     K2 = K // 2
 
     assert W.shape == (N, K2), f"W must be [N, K//2], got {W.shape}"
-    assert w_scale_group.shape == (num_groups, N), (
-        f"w_scale_group must be [num_groups, N]={num_groups, N}, got {w_scale_group.shape}"
-    )
-    assert w_zero_group.shape == (num_groups, N), (
-        f"w_zero_group must be [num_groups, N]={num_groups, N}, got {w_zero_group.shape}"
-    )
+    assert w_scale_group.shape == (
+        num_groups,
+        N,
+    ), f"w_scale_group must be [num_groups, N]={num_groups, N}, got {w_scale_group.shape}"
+    assert w_zero_group.shape == (
+        num_groups,
+        N,
+    ), f"w_zero_group must be [num_groups, N]={num_groups, N}, got {w_zero_group.shape}"
     group_size = K // num_groups
     assert group_size % 64 == 0, (
         f"group_size={group_size} must be divisible by 64 (2 * BLOCK_K_min=32); "
@@ -468,12 +502,8 @@ def matmul_bf16i4_rowwise(
     x_odd = X_2d[:, 1::2].contiguous()  # [M, K//2]
 
     if M == 1:
-        # GEMV path: tl.sum, no tl.dot.  Workspace [SPLIT_K, N] reduced on CPU.
-        # SPLIT_K is a constexpr chosen by autotune; we allocate for the max we
-        # support (32) and slice after the kernel writes its actual SPLIT_K rows.
-        # pre_hook zeros the workspace before each autotune trial and before
-        # the winning config's final run, so all MAX_SPLIT_K rows are clean.
-        _MAX_SPLIT_K = 32
+        # GEMV path: tl.sum, no tl.dot.  Workspace [SPLIT_K, N] reduced after.
+        _MAX_SPLIT_K = 64
         workspace = torch.empty((_MAX_SPLIT_K, N), dtype=torch.float32, device=X.device)
 
         def grid_gemv(meta):
@@ -494,18 +524,17 @@ def matmul_bf16i4_rowwise(
             W.stride(1),
             w_scale_group.stride(0),
             w_scale_group.stride(1),
+            EVEN_K=True,
         )
-        # pre_hook zeroed all rows before the winning run; only [:SPLIT_K] rows
-        # were written, the rest are 0 → sum all MAX_SPLIT_K rows safely.
         Y = workspace.sum(dim=0).to(torch.bfloat16)
         return Y.reshape(*leading, N)
 
     elif M <= _SPLITK_THRESH:
         # Split-K GEMM path: two tl.dot per tile, workspace [SPLIT_K, M, N].
-        # pre_hook zeros workspace before each autotune trial, so all rows are
-        # clean after the winning config's final run.
         _MAX_SPLIT_K = 8
-        workspace = torch.empty((_MAX_SPLIT_K, M, N), dtype=torch.float32, device=X.device)
+        workspace = torch.empty(
+            (_MAX_SPLIT_K, M, N), dtype=torch.float32, device=X.device
+        )
 
         def grid_splitk(meta):
             return (
@@ -531,6 +560,7 @@ def matmul_bf16i4_rowwise(
             W.stride(1),
             w_scale_group.stride(0),
             w_scale_group.stride(1),
+            EVEN_K=True,
         )
         Y = workspace.sum(dim=0).to(torch.bfloat16)
         return Y.reshape(*leading, N)
@@ -562,6 +592,7 @@ def matmul_bf16i4_rowwise(
             Y.stride(1),
             w_scale_group.stride(0),
             w_scale_group.stride(1),
+            EVEN_K=True,
         )
         return Y.reshape(*leading, N)
 
@@ -587,9 +618,9 @@ def matmul_bf16i4_rowwise_batched(
     B, M, K = X.shape
     _, N, _ = W.shape
     num_groups_total = w_scale.shape[0]
-    assert num_groups_total % B == 0, (
-        f"w_scale.shape[0]={num_groups_total} must be divisible by B={B}"
-    )
+    assert (
+        num_groups_total % B == 0
+    ), f"w_scale.shape[0]={num_groups_total} must be divisible by B={B}"
     num_groups = num_groups_total // B
 
     outs = []

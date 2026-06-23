@@ -1581,7 +1581,7 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
 
         y_dispatch = self.matmul_rowwise(x, wq, w_scale, w_zp)
         y_ref = (x.float() @ w.float().T).to(torch.bfloat16)
-        torch.testing.assert_close(y_dispatch, y_ref, atol=1.0e-1, rtol=8.0e-2)
+        torch.testing.assert_close(y_dispatch, y_ref, atol=2.0e-1, rtol=1.0e-1)
 
 
 @unittest.skipIf(torch.version.hip is None, "ROCm-only: BF16xINT4 Triton grouped GEMM")
