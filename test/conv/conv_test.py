@@ -12,32 +12,12 @@ import unittest
 import mslk.conv  # noqa: F401
 import torch
 from mslk.quantize.triton.fp8_quantize import quantize_fp8_tensor
+from mslk.testing.device import skipUnlessCuda, skipUnlessCudaCapability
 
 
-def evaluate_cuda_compute_capability(
-    major_min: int, major_max: int | None = None
-) -> bool:
-    major, _ = torch.cuda.get_device_capability()
-    return major >= major_min and (major_max is None or major <= major_max)
-
-
-def supports_f8f8bf16_conv() -> bool:
-    """Check if f8f8bf16_conv is supported on this device."""
-    if torch.cuda.is_available():
-        # Currently only supported on CUDA (not HIP) and requires SM100+
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-    return False
-
-
-@unittest.skipIf(
-    not torch.cuda.is_available(),
-    "Operators are only available on CUDA enabled machines",
-)
-@unittest.skipIf(
-    not supports_f8f8bf16_conv(),
-    "f8f8bf16_conv is not supported on this device.",
-)
+# f8f8bf16_conv is currently only supported on CUDA (not HIP) and requires SM100+.
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class F8F8BF16ConvTest(unittest.TestCase):
     """Test f8f8bf16_conv operator for correctness, compile, and export."""
 

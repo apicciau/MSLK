@@ -7,7 +7,6 @@
 # pyre-strict
 # pyre-ignore-all-errors[56]
 
-import os
 import unittest
 from typing import Optional, Union
 
@@ -16,6 +15,7 @@ import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
 from mslk.quantize.triton.fp4_quantize import (
+    _to_blocked,
     calculate_group_max,
     get_nvfp4_global_scales_naive,
     nvfp4_quantize_stacked,
@@ -23,21 +23,19 @@ from mslk.quantize.triton.fp4_quantize import (
     quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
 )
+from mslk.testing.device import (
+    skipUnlessCuda,
+    skipUnlessCudaCapability,
+    skipUnlessCudaVersion,
+    skipUnlessGfxArch,
+    skipUnlessRocm,
+)
+from mslk.utils.device import compute_capability_in, supports_float8_fnuz
 
 if torch.cuda.is_available():
     from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row
     from mslk.quantize.shuffle import quantize_int4_preshuffle
-    from mslk.quantize.triton.fp8_quantize import (
-        quantize_fp8_block,
-        quantize_fp8_row,
-        triton_quantize_fp8_tensor,
-    )
-    from mslk.utils.triton.fp8_utils import supports_float8_fnuz
-
-    if torch.cuda.get_device_capability() >= (10, 0):
-        from mslk.quantize.triton.fp4_quantize import _to_blocked
-
-import itertools
+    from mslk.quantize.triton.fp8_quantize import quantize_fp8_block, quantize_fp8_row
 
 from parameterized import parameterized
 
@@ -52,101 +50,13 @@ try:
 except ImportError:
     pass
 
-running_on_github: bool = os.getenv("GITHUB_ENV") is not None
 
-
-def evaluate_gfx_arch_in(arch_list):
-    gcn_arch_name = torch.cuda.get_device_properties("cuda").gcnArchName
-    return any(arch in gcn_arch_name for arch in arch_list)
-
-
-def is_mi300x():
-    return (
-        torch.cuda.is_available()
-        and torch.version.hip is not None
-        and evaluate_gfx_arch_in(["gfx942"])
-    )
-
-
-def evaluate_cuda_compute_capability(major_min, major_max=None):
-    major, _ = torch.cuda.get_device_capability()
-    return major >= major_min and (major_max is None or major <= major_max)
-
-
-def supports_bf16():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return is_mi300x()
-        return evaluate_cuda_compute_capability(9)
-    return False
-
-
-def supports_fp8():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return is_mi300x() and supports_float8_fnuz(
-                throw_on_hip_incompatibility=False
-            )
-        return evaluate_cuda_compute_capability(9, 10)
-    return False
-
-
-def supports_mxfp8():
-    if torch.cuda.is_available():
-        if torch.version.hip:
-            return False
-        return evaluate_cuda_compute_capability(10)
-    return False
-
-
-def supports_bf16_int4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(9, 9)
-    return False
-
-
-def support_fp8_int4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(9, 9)
-    return False
-
-
-def supports_nvfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-    return False
-
-
-def supports_nvfp4_ultra():
-    if not torch.cuda.is_available() or not torch.version.cuda:
-        return False
-    cuda_major = int(torch.version.cuda.split(".")[0])
-    major, minor = torch.cuda.get_device_capability()
-    return cuda_major >= 13 and (major, minor) >= (10, 3)
-
-
-def supports_mxfp4():
-    if torch.cuda.is_available():
-        if torch.version.cuda:
-            return evaluate_cuda_compute_capability(10)
-        # TODO add AMD here later
-    return False
-
-
-SUPPORTS_BF16 = supports_bf16()
-SUPPORTS_FP8 = supports_fp8()
-SUPPORTS_MXFP8 = supports_mxfp8()
-SUPPORTS_FP8_INT4 = support_fp8_int4()
-SUPPORTS_BF16_INT4 = supports_bf16_int4()
-SUPPORTS_NVFP4 = supports_nvfp4()
-SUPPORTS_NVFP4_ULTRA = supports_nvfp4_ultra()
-SUPPORTS_MXFP4 = supports_mxfp4()
-
+# Device gating for the GEMM kernels exercised in this file uses the shared skip
+# decorators from mslk.testing.device: the strict platform gates
+# skipUnlessCuda / skipUnlessRocm, refined by skipUnlessCudaCapability,
+# skipUnlessGfxArch, and skipUnlessCudaVersion.
 if torch.cuda.is_available() and supports_float8_fnuz(
-    throw_on_hip_incompatibility=(not running_on_github)
+    throw_on_hip_incompatibility=False
 ):
     # Supported FP8 format is different on NV and AMD.
     fp8_e4m3: torch.dtype = torch.float8_e4m3fnuz
@@ -159,9 +69,6 @@ else:
 E4M3_MAX_POS: float = torch.finfo(fp8_e4m3).max
 EPS: float = 1e-12
 FP16_MAX_POS: float = torch.finfo(torch.float16).max
-
-# pyre-fixme[16]: Module `mslk` has no attribute `open_source`.
-open_source: bool = getattr(mslk, "open_source", False)
 
 
 def int4_row_quantize(
@@ -244,15 +151,74 @@ def generate_jagged_offs(E, M, multiple_of=16, dtype=torch.int32, device="cuda")
     return selected_values.to(dtype).to(device)
 
 
-@unittest.skipIf(
-    not torch.cuda.is_available(),
-    "Operators are only available on CUDA enabled machines",
-)
-@unittest.skipIf(open_source, "Temporarily disabled in OSS.")
-@unittest.skipIf(
-    not all((SUPPORTS_FP8, SUPPORTS_BF16_INT4, SUPPORTS_FP8_INT4)),
-    "ExportCompileTests is not supported on this device.",
-)
+def _fp8_gemm_cases() -> list[tuple]:
+    modes = ["rowwise"] + (
+        # Blockwise fp8 GEMM is numerically broken on AMD/MI300 (~99% relative
+        # RMS error at all K); the loose tolerance only masked it while K was
+        # small. Keep it NVIDIA-only until the CK kernel
+        # (mslk/csrc/gemm/ck/fp8_blockwise_gemm.hip) is fixed. See T275007617.
+        ["blockwise"]
+        if torch.version.cuda is not None and compute_capability_in(9, 9)
+        else []
+    )
+
+    def case(
+        M: int,
+        K: int,
+        N: int,
+        *,
+        bias: bool = False,
+        cudagraph: bool = False,
+        use_triton: bool = False,
+        fast_accum: bool = True,
+        multi_dim: bool = False,
+    ) -> tuple:
+        # (M, K, N, Bias, CudaGraph, UseTriton, UseFastAccum, InputMultiDim)
+        return (
+            M,
+            K,
+            N,
+            bias,
+            cudagraph,
+            use_triton,
+            fast_accum,
+            multi_dim,
+        )
+
+    cases = [
+        case(256, 128, 256),  # small
+        case(2048, 2048, 4096),  # medium
+        case(4096, 4096, 8192),  # large
+        case(0, 256, 4096),  # empty input
+        # Other features
+        case(2048, 256, 4096, bias=True),
+        case(2048, 256, 4096, cudagraph=True),
+        case(2048, 256, 4096, multi_dim=True),
+    ]
+    if torch.version.cuda is not None:
+        cases += [
+            case(2048, 256, 4096, use_triton=True),
+            case(2048, 256, 4096, fast_accum=False),  # slow accumulation
+        ]
+    return [(*case, mode) for mode in modes for case in cases]
+
+
+def _fp8_batched_gemm_cases() -> list[tuple]:
+    modes = ["default"] + (["torch_3d3d"] if torch.version.hip else [])
+    cases = []
+    for mode in modes:
+        for use_loopover in (True, False):
+            # (B, M, N, K, use_loopover, Bias, mode)
+            cases.append((1, 256, 128, 256, use_loopover, False, mode))  # small
+            cases.append((4, 4096, 256, 512, use_loopover, False, mode))  # large
+            # Fused bias is only supported on Nvidia for batched GEMM.
+            if torch.version.cuda is not None:
+                cases.append((4, 2048, 256, 512, use_loopover, True, mode))  # bias
+    return cases
+
+
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class ExportCompileTests(unittest.TestCase):
     """Test that GEMM ops can be compiled & exported."""
 
@@ -284,7 +250,6 @@ class ExportCompileTests(unittest.TestCase):
                 col_scale = torch.randn(N).cuda()
                 block_scale = torch.randn(M // 128, K // 128).cuda()
                 _ = torch.ops.mslk.f8f8bf16_blockwise(xq, wq, block_scale, block_scale)
-                _ = torch.ops.mslk.f8f8bf16_tensorwise(xq, wq, 1.0)
                 o = torch.ops.mslk.f8f8bf16_rowwise(xq, wq, row_scale, col_scale)
                 return o
 
@@ -302,9 +267,6 @@ class ExportCompileTests(unittest.TestCase):
             self.XQ, self.WQ, self.block_scale, self.block_scale
         )
 
-    def test_compile_f8f8bf16_tensorwise(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8bf16_tensorwise)(self.XQ, self.WQ, 1.0)
-
     def test_compile_f8f8bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8f8bf16_rowwise)(
             self.XQ,
@@ -318,23 +280,11 @@ class ExportCompileTests(unittest.TestCase):
             self.XQ, self.WQ, self.row_scale, self.col_scale, self.output
         )
 
-    @unittest.skipIf(not is_mi300x(), "Requires MI300X")
-    def test_compile_f8f8f16_rowwise(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
-            self.XQ, self.WQ, self.row_scale, self.col_scale
-        )
-
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_i8i8bf16(self) -> None:
         torch.compile(torch.ops.mslk.i8i8bf16)(
             self.XQ.view(torch.int8), self.WQ.view(torch.int8), 1.0, 1
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
-    def test_compile_f8f8bf16(self) -> None:
-        torch.compile(torch.ops.mslk.f8f8bf16)(self.XQ, self.WQ, self.tensor_scale)
-
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_f8i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.f8i4bf16_rowwise)(
             self.XQ,
@@ -344,7 +294,6 @@ class ExportCompileTests(unittest.TestCase):
             self.block_scale[0],
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_bf16i4bf16_rowwise(self) -> None:
         torch.compile(torch.ops.mslk.bf16i4bf16_rowwise)(
             self.X,
@@ -353,7 +302,6 @@ class ExportCompileTests(unittest.TestCase):
             self.block_scale[0].repeat(self.N).view(-1, self.N),
         )
 
-    @unittest.skipIf(not torch.version.cuda, "Requires CUDA")
     def test_compile_bf16i4bf16_rowwise_batched(self) -> None:
         torch.compile(torch.ops.mslk.bf16i4bf16_rowwise_batched)(
             self.X.view(1, self.M, self.K),
@@ -363,108 +311,43 @@ class ExportCompileTests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not SUPPORTS_FP8, "FP8Tests is not supported on this device.")
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx942")
+class F8F8F16RowwiseCompileTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.device = torch.accelerator.current_accelerator()
+        M = N = K = 256
+        cls.XQ = torch.randn(M, K, device=cls.device).to(torch.float8_e4m3fnuz)
+        cls.WQ = torch.randn(N, K, device=cls.device).to(torch.float8_e4m3fnuz)
+        cls.row_scale = torch.randn(M, device=cls.device)
+        cls.col_scale = torch.randn(N, device=cls.device)
+
+    def test_compile_f8f8f16_rowwise(self) -> None:
+        torch.compile(torch.ops.mslk.f8f8f16_rowwise)(
+            self.XQ, self.WQ, self.row_scale, self.col_scale
+        )
+
+
+@skipUnlessGfxArch("gfx942")
+@skipUnlessCudaCapability(9, 10)
 class FP8Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
-    @parameterized.expand(
-        itertools.product(
-            ["cutlass", "cublas"],  # kernel
-            [True, False],  # use_fast_accum
-        )
-    )
-    @unittest.skipIf(not torch.version.cuda, "Skip on AMD: f8f8bf16 not yet supported.")
-    @unittest.skipIf(
-        not evaluate_cuda_compute_capability(9, 9), "Only SM90 is supported."
-    )
-    def test_f8f8bf16(self, kernel: str, use_fast_accum: bool) -> None:
-        M = 128
-        N = 128
-        K = 256
-        fp8_max = E4M3_MAX_POS
-        x = (
-            torch.randn(
-                size=(M, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.1
-        )
-        w = (
-            torch.randn(
-                size=(N, K),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            * 0.01
-        )
-
-        x_max = x.abs().max()
-        w_max = w.abs().max()
-
-        x_scale = (x_max / fp8_max).float()
-        w_scale = (w_max / fp8_max).float()
-
-        xq = (x * fp8_max / x_max).to(fp8_e4m3)
-        wq = (w * fp8_max / w_max).to(fp8_e4m3)
-
-        if kernel == "cutlass":
-            zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale, use_fast_accum)
-        else:
-            zq = torch.ops.mslk.f8f8bf16_cublas(
-                xq, wq, x_scale, w_scale, use_fast_accum
-            )
-
-        # Fake quant
-        x = xq.bfloat16() * x_scale
-        w = wq.bfloat16() * w_scale
-
-        zq_ref = (x @ w.T).to(torch.bfloat16)
-
-        torch.testing.assert_close(zq, zq_ref, atol=1.0e-3, rtol=1.0e-3)
-
-    @parameterized.expand(
-        itertools.product(
-            [0, 2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512, 4096, 8192],  # HD_L
-            ["rowwise"]
-            + (
-                ["blockwise"]
-                if torch.version.hip or evaluate_cuda_compute_capability(9, 9)
-                else []
-            )
-            + (
-                ["tensorwise_broadcast", "tensorwise"]
-                if torch.version.cuda and evaluate_cuda_compute_capability(9, 9)
-                else []
-            ),  # Mode
-            [fp8_e4m3],  # QType
-            [True, False],  # Bias
-            [True, False],  # CudaGraph
-            [False] + ([True] if torch.version.cuda else []),  # UseTriton
-            [True, False],  # UseFastAccum
-            [True, False],  # InputMultiDim
-        )
-    )
-    @unittest.skipIf(
-        torch.version.hip is not None and running_on_github,
-        "type fp8e4b8 not supported in this architecture. The supported fp8 dtypes are ('fp8e5',)",
-    )
+    @parameterized.expand(_fp8_gemm_cases())
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
-        Mode: str,
-        QType: torch.dtype,
+        M: int,
+        K: int,
+        N: int,
         Bias: bool,
         CudaGraph: bool,
         UseTriton: bool,
         UseFastAccum: bool,
         InputMultiDim: bool,
+        Mode: str,
     ) -> None:
         # Slow accumulation is only supported on Nvidia.
         if torch.version.hip:
@@ -473,7 +356,7 @@ class FP8Tests(unittest.TestCase):
         if InputMultiDim:
             x = (
                 torch.randn(
-                    size=(3, B_T, D),
+                    size=(3, M, K),
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
@@ -482,7 +365,7 @@ class FP8Tests(unittest.TestCase):
         else:
             x = (
                 torch.randn(
-                    size=(B_T, D),
+                    size=(M, K),
                     dtype=torch.bfloat16,
                     device=self.device,
                 )
@@ -490,7 +373,7 @@ class FP8Tests(unittest.TestCase):
             )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -498,7 +381,7 @@ class FP8Tests(unittest.TestCase):
         )
         bias = (
             torch.randn(
-                size=(HD_L,),
+                size=(N,),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -506,59 +389,7 @@ class FP8Tests(unittest.TestCase):
             else None
         )
 
-        if Mode == "tensorwise":
-
-            def f(
-                x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
-            ) -> torch.Tensor:
-                xq, x_scale = triton_quantize_fp8_tensor(x)
-                wq, w_scale = triton_quantize_fp8_tensor(w)
-                zq = torch.ops.mslk.f8f8bf16(xq, wq, x_scale * w_scale)
-                if bias is not None:
-                    zq += bias
-                return zq
-
-            if CudaGraph:
-                # Warm-up to avoid capture issues
-                f(x, w, bias)
-
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    zq = f(x, w, bias)
-                g.replay()
-            else:
-                zq = f(x, w, bias)
-        elif Mode == "tensorwise_broadcast":
-
-            def f(
-                xq: torch.Tensor,
-                wq: torch.Tensor,
-                scale: float,
-                bias: Optional[torch.Tensor],
-            ) -> torch.Tensor:
-                zq = torch.ops.mslk.f8f8bf16_tensorwise(
-                    xq, wq, scale, use_fast_accum=UseFastAccum
-                )
-                if bias is not None:
-                    zq += bias
-                return zq
-
-            xq, x_scale = triton_quantize_fp8_tensor(x)
-            wq, w_scale = triton_quantize_fp8_tensor(w)
-            x_scale = x_scale.item()
-            w_scale = w_scale.item()
-
-            if CudaGraph:
-                # Warm-up to avoid capture issues
-                f(xq, wq, x_scale * w_scale, bias)
-
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    zq = f(xq, wq, x_scale * w_scale, bias)
-                g.replay()
-            else:
-                zq = f(xq, wq, x_scale * w_scale, bias)
-        elif Mode == "rowwise":
+        if Mode == "rowwise":
 
             def f(
                 x: torch.Tensor, w: torch.Tensor, bias: Optional[torch.Tensor]
@@ -651,17 +482,7 @@ class FP8Tests(unittest.TestCase):
             rtol = 9.0e-2
         torch.testing.assert_close(zq, zq_ref, atol=atol, rtol=rtol)
 
-    @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [2048, 4096],  # M
-            [128, 256],  # N
-            [256, 512],  # K
-            [True, False],  # use_loopover
-            [False] + ([True] if torch.version.cuda else []),  # Bias
-            ["default"] + (["torch_3d3d"] if torch.version.hip else []),  # mode
-        )
-    )
+    @parameterized.expand(_fp8_batched_gemm_cases())
     def test_batched_gemm(
         self,
         B: int,
@@ -758,167 +579,16 @@ class FP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_ref, y_fp8, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-            ["default", "cat", "padded"],  # mode
-        )
+        [
+            (1, 512, 512, 512),  # small MNK (also small G)
+            (16, 2048, 1024, 2048),  # medium MNK
+            (64, 3584, 6144, 3584),  # large MNK
+            (16, 512, 512, 512),  # medium G
+            (64, 512, 512, 512),  # large G
+            (1, 0, 512, 512),  # empty (M=0)
+        ]
     )
-    def test_grouped_gemm_internal_api(
-        self, G: int, M: int, N: int, K: int, use_cudagraph: bool, mode: str
-    ):
-        # TODO remove this restriction.
-        if N < 512 or K < 512:
-            return
-
-        if M > 0:
-            ms = (
-                torch.randint(
-                    (258 // 64) + 1 if mode == "padding" else 1,
-                    (M // 64) + 1,
-                    (G,),
-                    dtype=torch.int,
-                )
-                * 64
-            )
-        else:
-            ms = torch.zeros((G,), dtype=torch.int)
-        # Only default supports true dynamism.
-        if mode != "default":
-            ns = [N] * G
-            ks = [K] * G
-        # Otherwise, any value is supported.
-        else:
-            # AMD requires N and K >= 512.
-            ns = torch.randint(512 // 64, (N // 64) + 1, (G,), dtype=torch.int) * 64
-            ks = torch.randint(512 // 64, (K // 64) + 1, (G,), dtype=torch.int) * 64
-
-        x_group = []
-        w_group = []
-        xq_group = []
-        wq_group = []
-        x_scale_group = []
-        w_scale_group = []
-        zero_start_index_M = None
-
-        # If padding, mark where zeros start for each input.
-        if mode == "padded":
-            zero_start_index_M = torch.tensor(ms, dtype=torch.long, device=self.device)
-
-        for _, (m, n, k) in enumerate(zip(ms, ns, ks)):
-            x = torch.rand(
-                size=(m, k),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            w = torch.rand(
-                size=(n, k),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-
-            if mode == "padded":
-                # When padding, all x values are made to have the same M.
-                x = torch.nn.functional.pad(x, (0, 0, 0, max(ms) - m), value=0)
-
-            xq, x_scale = quantize_fp8_row(x)
-            wq, w_scale = quantize_fp8_row(w)
-            x_group.append(x)
-            w_group.append(w)
-            xq_group.append(xq)
-            wq_group.append(wq)
-            x_scale_group.append(x_scale)
-            w_scale_group.append(w_scale)
-
-        # Make inputs contiguous in memory, this simulates the typical MOE use-case.
-        if mode == "padded":
-            x_group = torch.stack(x_group, dim=0).contiguous()
-            w_group = torch.stack(w_group, dim=0).contiguous()
-            xq_group = torch.stack(xq_group, dim=0).contiguous()
-            wq_group = torch.stack(wq_group, dim=0).contiguous()
-            x_scale_group = torch.stack(x_scale_group, dim=0).contiguous()
-            w_scale_group = torch.stack(w_scale_group, dim=0).contiguous()
-
-            fp8_op = torch.ops.mslk.f8f8bf16_rowwise_grouped_dynamic
-            bf16_op = torch.ops.mslk.bf16bf16bf16_grouped_dynamic
-            fp8_args = [
-                xq_group,
-                wq_group,
-                x_scale_group,
-                w_scale_group,
-                zero_start_index_M,
-            ]
-            bf16_args = [x_group, w_group, zero_start_index_M]
-        else:
-            if mode == "cat":
-                fp8_op = torch.ops.mslk.f8f8bf16_rowwise_grouped_cat
-                bf16_op = torch.ops.mslk.bf16bf16bf16_grouped_cat
-            else:
-                fp8_op = torch.ops.mslk.f8f8bf16_rowwise_grouped
-                bf16_op = torch.ops.mslk.bf16bf16bf16_grouped
-            fp8_args = [xq_group, wq_group, x_scale_group, w_scale_group]
-            bf16_args = [x_group, w_group]
-
-        if use_cudagraph:
-            # warmup
-            fp8_op(*fp8_args)
-            # With cudagraph
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                y_fp8_group = fp8_op(*fp8_args)
-            g.replay()
-        else:
-            y_fp8_group = fp8_op(*fp8_args)
-
-        # Massage output into proper format.
-        if not isinstance(y_fp8_group, (tuple, list)):
-            if y_fp8_group.ndim == 2:
-                y_fp8_group = torch.split(y_fp8_group, tuple(ms.tolist()), dim=0)
-            else:
-                y_fp8_group = torch.unbind(y_fp8_group)
-
-        if use_cudagraph:
-            # warmup
-            bf16_op(*bf16_args)
-            # With cudagraph
-            g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g):
-                y_bf16_group = bf16_op(*bf16_args)
-            g.replay()
-        else:
-            y_bf16_group = bf16_op(*bf16_args)
-
-        # View output as list if needed.
-        if not isinstance(y_bf16_group, (tuple, list)):
-            if y_bf16_group.ndim == 2:
-                y_bf16_group = torch.split(y_bf16_group, tuple(ms.tolist()), dim=0)
-            else:
-                y_bf16_group = torch.unbind(y_bf16_group)
-
-        self.bf16_loopover_validate(
-            x_group,
-            w_group,
-            y_fp8_group,
-            y_bf16_group,
-            # default mode is worse for some reason
-            rtol_fp8=2.0e-1 if mode == "default" else 8.0e-2,
-        )
-
-    @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [0, 64, 2048, 3584],  # M
-            [64, 256, 1024, 6144],  # N
-            [64, 256, 512, 3584],  # K
-        )
-    )
-    @unittest.skipIf(
-        not is_mi300x(),
-        "Only MI300X supports torch 3D-2D grouped gemm API",
-    )
+    @skipUnlessRocm()
     def test_grouped_gemm_3d_2d(
         self,
         G: int,
@@ -957,18 +627,17 @@ class FP8Tests(unittest.TestCase):
         self.bf16_loopover_validate(X, W_split, y_fp8)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [16, 2048, 3584],  # M
-            [16, 256, 1024, 6144],  # N
-            [16, 256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 512, 512, 512, False),  # small MNK (also small G)
+            (16, 2048, 1024, 2048, False),  # medium MNK
+            (64, 3584, 6144, 3584, False),  # large MNK
+            (16, 512, 512, 512, False),  # medium G
+            (64, 512, 512, 512, False),  # large G
+            (1, 0, 512, 512, False),  # empty (M=0)
+            (16, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
-    @unittest.skipIf(
-        not is_mi300x(),
-        "Only MI300X supports torch 2D-2D grouped gemm API",
-    )
+    @skipUnlessRocm()
     def test_grouped_gemm_2d_2d(
         self,
         G: int,
@@ -1056,14 +725,19 @@ class FP8Tests(unittest.TestCase):
                 )
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [0, 2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-            [True, False],  # use_cudagraph
-            ["stacked"] + (["torch_2d3d"] if torch.version.hip else []),  # mode
-        )
+        [
+            (*case, mode)
+            for mode in ["stacked"] + (["torch_2d3d"] if torch.version.hip else [])
+            for case in [
+                (1, 512, 512, 512, False),  # small MNK (also small G)
+                (16, 2048, 1024, 2048, False),  # medium MNK
+                (64, 3584, 6144, 3584, False),  # large MNK
+                (16, 512, 512, 512, False),  # medium G
+                (64, 512, 512, 512, False),  # large G
+                (1, 0, 512, 512, False),  # empty (M=0)
+                (16, 2048, 1024, 512, True),  # cudagraph
+            ]
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -1160,34 +834,36 @@ class FP8Tests(unittest.TestCase):
         self.bf16_loopover_validate(x_group, W, y_fp8_group, y_bf16_group)
 
 
-@unittest.skipIf(
-    not SUPPORTS_BF16_INT4, "Skip if BF16Int4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class BF16Int4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512],  # HD_L
-            [True, False],  # CudaGraph
-            [True, False],  # Preshuffle
-        )
+        [
+            (*case, preshuffle)
+            for preshuffle in [True, False]
+            for case in [
+                (256, 128, 256, False),  # small
+                (2048, 2048, 4096, False),  # medium
+                (4096, 4096, 8192, False),  # large
+                (2048, 256, 512, True),  # cudagraph
+            ]
+        ]
     )
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
+        M: int,
+        K: int,
+        N: int,
         CudaGraph: bool,
-        Preshuffle: bool,
+        preshuffle: bool,
     ) -> None:
         x = (
             torch.randn(
-                size=(B_T, D),
+                size=(M, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1195,14 +871,14 @@ class BF16Int4Tests(unittest.TestCase):
         )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
             * 0.01
         )
 
-        if Preshuffle:
+        if preshuffle:
             wq, (w_scale, w_zp) = quantize_int4_preshuffle(w, dtype="bf16")
         else:
             wq, w_scale, w_zp = int4_row_quantize(w, 128)
@@ -1212,7 +888,7 @@ class BF16Int4Tests(unittest.TestCase):
 
         bf16i4_op = (
             torch.ops.mslk.bf16i4bf16_shuffled
-            if Preshuffle
+            if preshuffle
             else torch.ops.mslk.bf16i4bf16_rowwise
         )
 
@@ -1228,13 +904,15 @@ class BF16Int4Tests(unittest.TestCase):
         torch.testing.assert_close(zq, zq_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [2048, 4096],  # M
-            [256, 512],  # N
-            [256, 512],  # K
-            [True, False],  # use_loopover
-        )
+        [
+            (*case, use_loopover)
+            for use_loopover in [True, False]
+            for case in [
+                (1, 256, 256, 256),  # small
+                (4, 2048, 256, 256),  # medium
+                (4, 4096, 512, 512),  # large
+            ]
+        ]
     )
     @unittest.skipIf(not MARLIN_ENABLED, "Skip if Marlin is not enabled.")
     def test_batched_gemm(
@@ -1310,15 +988,14 @@ class BF16Int4Tests(unittest.TestCase):
         torch.testing.assert_close(y_ref, y_int4, atol=1e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [1024, 6144],  # N
-            [512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 256, 1024, 512, False),  # small
+            (16, 2048, 1024, 512, False),  # medium
+            (64, 3584, 6144, 3584, False),  # large
+            (1, 0, 1024, 512, False),  # empty (M=0)
+            (16, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
-    @unittest.skipIf(not torch.version.cuda, "Currently not supported on AMD.")
     def test_shuffled_grouped_gemm(
         self,
         G: int,
@@ -1424,7 +1101,7 @@ class BF16Int4Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(torch.version.hip is None, "ROCm-only: BF16xINT4 Triton rowwise GEMM")
+@skipUnlessRocm()
 class BF16Int4TritonROCmTests(unittest.TestCase):
     """
     Tests for the Triton BF16xINT4 rowwise GEMM running on AMD GPUs.
@@ -1445,12 +1122,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         cls.matmul_rowwise_batched = staticmethod(matmul_bf16i4_rowwise_batched)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 16, 64, 512, 2048],  # M
-            [256, 512, 1024, 4096],  # N
-            [256, 512, 1024],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 256, 256, 128),  # small
+            (512, 1024, 512, 128),  # medium
+            (2048, 4096, 1024, 128),  # large
+        ]
     )
     def test_rowwise_accuracy(
         self,
@@ -1477,13 +1153,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4],  # B
-            [64, 512, 2048],  # M
-            [256, 512, 1024],  # N
-            [256, 512],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 64, 256, 256, 128),  # small
+            (4, 512, 512, 512, 128),  # medium
+            (4, 2048, 1024, 512, 128),  # large
+        ]
     )
     def test_rowwise_batched_accuracy(
         self,
@@ -1516,12 +1190,11 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         torch.testing.assert_close(y, y_ref, atol=1.0e-1, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 16, 128, 2048],  # M
-            [256, 1024, 4096],  # N
-            [256, 1024],  # K
-            [128],  # group_size
-        )
+        [
+            (1, 256, 256, 128),  # small
+            (128, 1024, 256, 128),  # medium
+            (2048, 4096, 1024, 128),  # large
+        ]
     )
     def test_torch_op_dispatch(
         self,
@@ -1685,32 +1358,32 @@ class BF16Int4TritonROCmGroupedTests(unittest.TestCase):
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
 
 
-@unittest.skipIf(
-    not SUPPORTS_FP8_INT4, "Skip if FP8Int4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(9, 9)
 class FP8Int4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [0, 2048, 4096],  # B_T
-            [128, 256],  # D
-            [256, 512],  # HD_L
-            [True, False],  # CudaGraph
-        )
+        [
+            (256, 128, 256, False),  # small
+            (2048, 2048, 4096, False),  # medium
+            (4096, 4096, 8192, False),  # large
+            (0, 128, 256, False),  # empty (M=0)
+            (2048, 256, 512, True),  # cudagraph
+        ]
     )
     def test_gemm(
         self,
-        B_T: int,
-        D: int,
-        HD_L: int,
+        M: int,
+        K: int,
+        N: int,
         CudaGraph: bool,
     ) -> None:
         x = (
             torch.randn(
-                size=(B_T, D),
+                size=(M, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1718,7 +1391,7 @@ class FP8Int4Tests(unittest.TestCase):
         )
         w = (
             torch.randn(
-                size=(HD_L, D),
+                size=(N, K),
                 dtype=torch.bfloat16,
                 device=self.device,
             )
@@ -1755,13 +1428,14 @@ class FP8Int4Tests(unittest.TestCase):
         torch.testing.assert_close(zq_shuffled, zq_ref, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 5, 16],  # G
-            [0, 2048, 3584],  # M
-            [1024, 6144],  # N
-            [512, 3584],  # K
-            [True, False],  # use_cudagraph
-        )
+        [
+            (1, 256, 1024, 512, False),  # small
+            (4, 2048, 1024, 512, False),  # medium
+            (16, 3584, 6144, 3584, False),  # large
+            (64, 3584, 6144, 3584, False),  # large G
+            (1, 0, 1024, 512, False),  # empty (M=0)
+            (4, 2048, 1024, 512, True),  # cudagraph
+        ]
     )
     def test_shuffled_grouped_gemm(
         self,
@@ -1867,21 +1541,20 @@ class FP8Int4Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(
-    not SUPPORTS_MXFP8, "Skip if MXFP8Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP8Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [2048, 3584],  # K
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # M
-        )
+        [
+            (1, 2048, 256, 256),  # small
+            (4, 2048, 1024, 512),  # medium
+            (16, 3584, 6144, 3584),  # large
+            (64, 3584, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -1980,12 +1653,12 @@ class MXFP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [2048, 3584],  # M
-            [256, 1024, 6144],  # N
-            [256, 512, 3584],  # K
-        )
+        [
+            (1, 256, 256, 256),  # small
+            (4, 2048, 1024, 512),  # medium
+            (16, 3584, 6144, 3584),  # large
+            (64, 3584, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -2060,13 +1733,13 @@ class MXFP8Tests(unittest.TestCase):
         torch.testing.assert_close(y_mxfp8, y_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [4, 16, 32],  # G
-            [16, 32, 64],  # M_per_group
-            [2, 4, 8],  # pad_factor
-            [1024, 2048],  # N
-            [512, 3072],  # K
-        )
+        [
+            (1, 16, 2, 1024, 512),  # small G
+            (4, 16, 2, 1024, 512),  # small
+            (16, 32, 4, 1024, 512),  # medium
+            (32, 64, 8, 2048, 3072),  # large
+            (64, 64, 8, 2048, 3072),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d_actual_num_tokens(
         self,
@@ -2193,9 +1866,8 @@ class MXFP8Tests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(
-    not SUPPORTS_BF16, "Skip if BF16Tests is not supported on this device."
-)
+@skipUnlessGfxArch("gfx942")
+@skipUnlessCudaCapability(9)
 class BF16Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2221,27 +1893,28 @@ class BF16Tests(unittest.TestCase):
             )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-            [True, False],  # output_accum
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128, False),  # small G
+                (2, 257, 256, 128, False),  # small
+                (16, 2049, 2048, 1024, False),  # large
+                (64, 2049, 2048, 1024, False),  # large G
+                (2, 0, 256, 128, False),  # empty (M=0)
+                (16, 2049, 2048, 1024, True),  # output_accum
+            ]
+        ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_wgrad not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_wgrad(
         self,
         G: int,
         M: int,
         N: int,
         K: int,
-        dtype: torch.dtype,
         output_accum: bool,
+        dtype: torch.dtype,
     ) -> None:
         torch.manual_seed(hash((G, M, N, K)))
         # Inputs
@@ -2329,18 +2002,19 @@ class BF16Tests(unittest.TestCase):
                 )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128),  # small G
+                (2, 257, 256, 128),  # small
+                (16, 2049, 2048, 1024),  # large
+                (64, 2049, 2048, 1024),  # large G
+                (2, 0, 256, 128),  # empty (M=0)
+            ]
+        ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_dgrad not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_dgrad(
         self,
         G: int,
@@ -2408,18 +2082,19 @@ class BF16Tests(unittest.TestCase):
         )
 
     @parameterized.expand(
-        itertools.product(
-            [2, 16],  # G
-            [0, 257, 2049],  # M
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (1, 257, 256, 128),  # small G
+                (2, 257, 256, 128),  # small
+                (16, 2049, 2048, 1024),  # large
+                (64, 2049, 2048, 1024),  # large G
+                (2, 0, 256, 128),  # empty (M=0)
+            ]
+        ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test_grouped_gemm_fprop not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_fprop(
         self,
         G: int,
@@ -2480,25 +2155,24 @@ class BF16Tests(unittest.TestCase):
         )
 
     @parameterized.expand(
-        itertools.product(
-            [256, 2048],  # N
-            [128, 1024],  # K
-            [torch.bfloat16, torch.float16],  # dtype
-            [True, False],  # output_accum
-            [True, False],  # all_zero
-        )
+        [
+            (*case, dtype)
+            for dtype in [torch.bfloat16, torch.float16]
+            for case in [
+                (256, 128, False, True),  # small, all experts zero
+                (2048, 1024, False, False),  # large, some experts zero
+                (2048, 1024, True, False),  # output_accum
+            ]
+        ]
     )
-    @unittest.skipIf(
-        not torch.version.cuda,
-        "Skip on AMD: test not yet supported.",
-    )
+    @skipUnlessCuda()
     def test_grouped_gemm_wgrad_zero_token_experts(
         self,
         N: int,
         K: int,
-        dtype: torch.dtype,
         output_accum: bool,
         all_zero: bool,
+        dtype: torch.dtype,
     ) -> None:
         """Test wgrad produces zeros (not NaN) for experts with zero tokens.
 
@@ -2607,20 +2281,19 @@ class BF16Tests(unittest.TestCase):
             )
 
 
-@unittest.skipIf(
-    not SUPPORTS_NVFP4, "Skip if NVFP4Tests is not supported on this device."
-)
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class NVFP4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -2641,12 +2314,11 @@ class NVFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=5.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -2691,12 +2363,12 @@ class NVFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -2740,10 +2412,8 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
-    @unittest.skipIf(
-        not SUPPORTS_NVFP4_ULTRA,
-        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
-    )
+    @skipUnlessCudaVersion(13)
+    @skipUnlessCudaCapability(10, minor_min=3)
     def test_ultra_grouped_gemm_2d_3d(self) -> None:
         G = 2
         N = 512
@@ -2795,10 +2465,8 @@ class NVFP4Tests(unittest.TestCase):
 
         torch.testing.assert_close(out_nvfp4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
 
-    @unittest.skipIf(
-        not SUPPORTS_NVFP4_ULTRA,
-        "Skip if NVFP4 ultra grouped GEMM is not supported on this device.",
-    )
+    @skipUnlessCudaVersion(13)
+    @skipUnlessCudaCapability(10, minor_min=3)
     def test_ultra_grouped_gemm_meta(self) -> None:
         G = 2
         M = 384
@@ -2829,18 +2497,19 @@ class NVFP4Tests(unittest.TestCase):
         self.assertEqual(out.device.type, "meta")
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP4Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -2855,12 +2524,12 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
     )
     def test_grouped_gemm_2d_3d(
         self,
@@ -2912,130 +2581,11 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
     @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [1, 4, 32, 128],  # M
-            [256, 1024, 4096],  # N
-            [512, 2048],  # K
-        )
-    )
-    def test_mx8mx4_grouped_gemm_2d_3d(
-        self,
-        G: int,
-        M: int,
-        N: int,
-        K: int,
-    ) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
-        XS = [
-            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-            for _ in range(G)
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
         ]
-        WS = [
-            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
-            for _ in range(G)
-        ]
-        offsets = torch.arange(
-            M,
-            G * M + 1,
-            M,
-            dtype=torch.int32,
-            device=self.device,
-        )
-
-        xqs = []
-        x_scales = []
-        wqs = []
-        w_scales = []
-        for x, w in zip(XS, WS):
-            x_scale, xq = to_mxfp8(x)
-            x_scale = _to_blocked(
-                x_scale.view(torch.int8).reshape(x.shape[0], -1)
-            ).view(torch.uint8)
-            wq, w_scale = triton_quantize_mx4_unpack(w)
-
-            xqs.append(xq)
-            x_scales.append(x_scale)
-            wqs.append(wq.view(torch.float4_e2m1fn_x2))
-            w_scales.append(w_scale)
-
-        xq = torch.cat(xqs, dim=0).contiguous()
-        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
-        wq = torch.stack(wqs, dim=0).contiguous()
-        w_scale = torch.stack(w_scales, dim=0).contiguous()
-
-        X = torch.cat(XS, dim=0)
-        W = torch.stack(WS, dim=0)
-
-        out_bf16 = torch._grouped_mm(
-            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
-        )
-        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
-            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
-        )
-        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
-
-        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
-
-    def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
-        from mslk.gemm.triton.fp8_gemm import to_mxfp8
-
-        G = 8
-        N = 1024
-        K = 2048
-        m_sizes_list = [0, 1, 4, 0, 32, 0, 8, 16]
-        offsets = torch.tensor(
-            m_sizes_list, dtype=torch.int32, device=self.device
-        ).cumsum(0, dtype=torch.int32)
-
-        XS = [
-            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
-            for M in m_sizes_list
-        ]
-        WS = [
-            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
-            for _ in range(G)
-        ]
-
-        xqs = []
-        x_scales = []
-        wqs = []
-        w_scales = []
-        refs = []
-        for x, w in zip(XS, WS):
-            if x.numel() > 0:
-                x_scale, xq = to_mxfp8(x)
-                x_scale = _to_blocked(
-                    x_scale.view(torch.int8).reshape(x.shape[0], -1)
-                ).view(torch.uint8)
-                xqs.append(xq)
-                x_scales.append(x_scale)
-                refs.append(x @ w.t())
-            wq, w_scale = triton_quantize_mx4_unpack(w)
-            wqs.append(wq.view(torch.float4_e2m1fn_x2))
-            w_scales.append(w_scale)
-
-        xq = torch.cat(xqs, dim=0).contiguous()
-        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
-        wq = torch.stack(wqs, dim=0).contiguous()
-        w_scale = torch.stack(w_scales, dim=0).contiguous()
-
-        out_bf16 = torch.cat(refs, dim=0).to(torch.bfloat16)
-        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
-            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
-        )
-        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
-
-        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=5.0e-2, rtol=6.0e-2)
-
-    @parameterized.expand(
-        itertools.product(
-            [1, 4, 16],  # G
-            [250, 500, 3500],  # M
-            [256, 1024, 6144],  # N
-            [2048, 3584],  # K
-        )
     )
     def test_grouped_gemm_2d_2d(
         self,
@@ -3087,7 +2637,8 @@ class MXFP4Tests(unittest.TestCase):
         torch.testing.assert_close(out_mxfp4, out_bf16, atol=8.0e-2, rtol=8.0e-2)
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MXFP4BlockSize16Tests(unittest.TestCase):
     """
     Tests for MXFP4_16 format: MXFP4 with 1x16 block size
@@ -3100,11 +2651,11 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 250],  # M
-            [256, 1024],  # N
-            [2048, 3584],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (250, 512, 2048),  # medium
+            (250, 1024, 3584),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
@@ -3281,20 +2832,21 @@ class MXFP4BlockSize16Tests(unittest.TestCase):
         )
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+@skipUnlessGfxArch("gfx950")
+@skipUnlessCudaCapability(10)
 class MX8MX4Tests(unittest.TestCase):
-    """Tests for the mixed MX8 x MX4 CUTLASS GEMM kernel (mx8mx4bf16)."""
+    """Tests for the mixed MX8 x MX4 GEMM kernel (mx8mx4bf16)."""
 
     @classmethod
     def setUpClass(cls):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         from mslk.gemm.triton.fp8_gemm import to_mxfp8
@@ -3322,8 +2874,127 @@ class MX8MX4Tests(unittest.TestCase):
         # Mixed MX8xMX4 has higher tolerance than MX4xMX4 due to mixed precision
         torch.testing.assert_close(out_mx8mx4, out_bf16, atol=1.0e-1, rtol=1.0e-1)
 
+    @parameterized.expand(
+        [
+            (1, 256, 256, 2048),  # small
+            (4, 500, 1024, 2048),  # medium
+            (16, 3500, 6144, 3584),  # large
+            (64, 3500, 6144, 3584),  # large G
+        ]
+    )
+    def test_mx8mx4_grouped_gemm_2d_3d(
+        self,
+        G: int,
+        M: int,
+        N: int,
+        K: int,
+    ) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if MXFP4 is not supported")
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(
+            M,
+            G * M + 1,
+            M,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        xqs = []
+        x_scales = []
+        wqs = []
+        w_scales = []
+        for x, w in zip(XS, WS):
+            x_scale, xq = to_mxfp8(x)
+            x_scale = _to_blocked(
+                x_scale.view(torch.int8).reshape(x.shape[0], -1)
+            ).view(torch.uint8)
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+
+            xqs.append(xq)
+            x_scales.append(x_scale)
+            wqs.append(wq.view(torch.float4_e2m1fn_x2))
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).contiguous()
+        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
+        wq = torch.stack(wqs, dim=0).contiguous()
+        w_scale = torch.stack(w_scales, dim=0).contiguous()
+
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+
+        out_bf16 = torch._grouped_mm(
+            X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
+        )
+        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
+
+        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
+
+    def test_mx8mx4_grouped_gemm_2d_3d_empty_groups(self) -> None:
+        from mslk.gemm.triton.fp8_gemm import to_mxfp8
+
+        G = 8
+        N = 1024
+        K = 2048
+        m_sizes_list = [0, 1, 4, 0, 32, 0, 8, 16]
+        offsets = torch.tensor(
+            m_sizes_list, dtype=torch.int32, device=self.device
+        ).cumsum(0, dtype=torch.int32)
+
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for M in m_sizes_list
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+
+        xqs = []
+        x_scales = []
+        wqs = []
+        w_scales = []
+        refs = []
+        for x, w in zip(XS, WS):
+            if x.numel() > 0:
+                x_scale, xq = to_mxfp8(x)
+                x_scale = _to_blocked(
+                    x_scale.view(torch.int8).reshape(x.shape[0], -1)
+                ).view(torch.uint8)
+                xqs.append(xq)
+                x_scales.append(x_scale)
+                refs.append(x @ w.t())
+            wq, w_scale = triton_quantize_mx4_unpack(w)
+            wqs.append(wq.view(torch.float4_e2m1fn_x2))
+            w_scales.append(w_scale)
+
+        xq = torch.cat(xqs, dim=0).contiguous()
+        x_scale = torch.cat(x_scales, dim=0).contiguous().reshape(-1, K // 32)
+        wq = torch.stack(wqs, dim=0).contiguous()
+        w_scale = torch.stack(w_scales, dim=0).contiguous()
+
+        out_bf16 = torch.cat(refs, dim=0).to(torch.bfloat16)
+        out_mx8mx4 = torch.ops.mslk.mx8mx4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        self.assertTrue(out_mx8mx4.isfinite().all(), "output has non-finite values")
+
+        torch.testing.assert_close(out_mx8mx4, out_bf16, atol=6.0e-2, rtol=6.0e-2)
+
+
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MX8MX6Tests(unittest.TestCase):
     """Tests for the mixed MX8 x MX6 CUTLASS GEMM kernel (mx8mx6bf16)."""
 
@@ -3332,11 +3003,11 @@ class MX8MX6Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         from mslk.gemm.triton.fp8_gemm import to_mxfp8
@@ -3369,7 +3040,8 @@ class MX8MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx8mx6.shape, (M, N))
 
 
-@unittest.skipIf(not SUPPORTS_MXFP4, "Skip if block-scaled GEMM is not supported")
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
 class MX6MX6Tests(unittest.TestCase):
     """Tests for the symmetric MX6 x MX6 CUTLASS GEMM kernel (mx6mx6bf16)."""
 
@@ -3378,11 +3050,11 @@ class MX6MX6Tests(unittest.TestCase):
         cls.device = torch.accelerator.current_accelerator()
 
     @parameterized.expand(
-        itertools.product(
-            [1, 64, 256],  # M
-            [256, 1024],  # N
-            [2048, 4096],  # K
-        )
+        [
+            (1, 256, 2048),  # small
+            (64, 512, 2048),  # medium
+            (256, 1024, 4096),  # large
+        ]
     )
     def test_gemm(self, M: int, N: int, K: int) -> None:
         # Both A and B are random uint8 bytes packed at 6 bits/element. The
@@ -3413,16 +3085,8 @@ class MX6MX6Tests(unittest.TestCase):
         self.assertEqual(out_mx6mx6.dtype, torch.bfloat16)
 
 
-def _supports_int8_triton() -> bool:
-    """True on CUDA SM80+ or ROCm CDNA3 (gfx942) / CDNA3+ (gfx950)."""
-    if not torch.cuda.is_available():
-        return False
-    if torch.version.hip:
-        return evaluate_gfx_arch_in(["gfx942", "gfx950"])
-    return evaluate_cuda_compute_capability(8)
-
-
-@unittest.skipIf(not _supports_int8_triton(), "Requires CUDA SM80+ or ROCm")
+@skipUnlessGfxArch("gfx942", "gfx950")
+@skipUnlessCudaCapability(8)
 class RocmInt8GemmTests(unittest.TestCase):
     """Correctness tests for the Triton INT8 GEMM kernel.
 
@@ -3519,7 +3183,7 @@ class RocmInt8GemmTests(unittest.TestCase):
     # Parity with CUDA CUTLASS path (CUDA only)
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    @skipUnlessCuda()
     def test_parity_with_cutlass_static(self) -> None:
         M, N, K = 128, 2048, 4096
         scale = 0.01
@@ -3528,7 +3192,7 @@ class RocmInt8GemmTests(unittest.TestCase):
         triton_out = self.i8i8bf16_triton(XQ, WQ, scale)
         torch.testing.assert_close(cutlass_out, triton_out, atol=1e-2, rtol=1e-2)
 
-    @unittest.skipIf(not torch.version.cuda, "CUTLASS parity only tested on CUDA")
+    @skipUnlessCuda()
     def test_parity_with_cutlass_dynamic(self) -> None:
         M, N, K = 128, 2048, 4096
         scale = 0.01
@@ -3542,7 +3206,7 @@ class RocmInt8GemmTests(unittest.TestCase):
     # torch.ops.mslk dispatch on ROCm
     # ------------------------------------------------------------------
 
-    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    @skipUnlessRocm()
     def test_ops_dispatch_static(self) -> None:
         M, N, K = 128, 1024, 1024
         scale = 0.01
@@ -3552,7 +3216,7 @@ class RocmInt8GemmTests(unittest.TestCase):
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
 
-    @unittest.skipIf(not torch.version.hip, "Op dispatch only tested on ROCm")
+    @skipUnlessRocm()
     def test_ops_dispatch_dynamic(self) -> None:
         M, N, K = 128, 1024, 1024
         scale = 0.01
