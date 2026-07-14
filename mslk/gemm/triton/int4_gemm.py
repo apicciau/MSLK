@@ -80,6 +80,7 @@ def _prune_configs(configs, named_args, **kwargs):
     M = named_args["M"]
     N = named_args["N"]
     K2 = named_args["K2"]
+    has_x_scale = kwargs.get("HAS_X_SCALE", False)
     pruned = []
     for c in configs:
         bm = c.kwargs["BLOCK_M"]
@@ -88,6 +89,7 @@ def _prune_configs(configs, named_args, **kwargs):
         sk = c.kwargs.get("SPLIT_K", 1)
         nw = c.num_warps
         ns = c.num_stages
+        gsm = c.kwargs.get("GROUP_SIZE_M", 4)
         # 2*BLOCK_K must divide group_size (dequant alignment)
         if group_size % (2 * bk) != 0:
             continue
@@ -109,6 +111,18 @@ def _prune_configs(configs, named_args, **kwargs):
         # Large tiles with many stages cause register spills
         if tile_elems >= 16384 and ns >= 3:
             continue
+        # FP8 path: tighter search based on profiled winning configs.
+        # Small BLOCK_N (32, 64) and BLOCK_K=128 never win; GROUP_SIZE_M
+        # does not affect winners, so fix to 4.
+        if has_x_scale:
+            if bn < 128 and N >= 128:
+                continue
+            if bk > 64:
+                continue
+            if sk == 2:
+                continue
+            if gsm != 4:
+                continue
         pruned.append(c)
     return pruned
 
@@ -134,10 +148,11 @@ def _prune_configs(configs, named_args, **kwargs):
 )
 @triton.jit
 def _bf16i4_rowwise_kernel(
-    X_even_ptr,  # [M, K//2]  bfloat16 — even K columns of activations
-    X_odd_ptr,  # [M, K//2]  bfloat16 — odd  K columns of activations
+    X_even_ptr,  # [M, K//2]  bfloat16 or FP8 — even K columns of activations
+    X_odd_ptr,  # [M, K//2]  bfloat16 or FP8 — odd  K columns of activations
     W_ptr,  # [N, K//2]  int8 packed (lo nibble = even K, hi = odd K)
-    Y_ptr,  # [M, N]     bfloat16
+    Y_ptr,  # [SPLIT_K, M, N]  float32 workspace
+    x_scale_ptr,  # [M] float32 per-row activation scale, or None
     scale_ptr,  # [num_groups, N]
     zero_ptr,  # [num_groups, N]
     M,
@@ -161,6 +176,7 @@ def _bf16i4_rowwise_kernel(
     EVEN_K: tl.constexpr,
     EVEN_MN: tl.constexpr,
     GRID_MN: tl.constexpr,
+    HAS_X_SCALE: tl.constexpr = False,
 ) -> None:
     """
     Computes Y[M, N] = X[M, K] @ dequant(W)[K, N].
@@ -169,6 +185,11 @@ def _bf16i4_rowwise_kernel(
     x_odd [M, K//2] (odd K columns) by the Python wrapper.  Each kernel
     iteration concatenates x_even and x_odd along K and issues a single
     fused tl.dot against the concatenated dequantised weights.
+
+    When HAS_X_SCALE is True (FP8 activation path):
+      - FP8 activations are upcast to bfloat16 for the dot (same as BF16 path).
+      - After the K-loop, the accumulator is multiplied by x_scale (per-row
+        activation dequant scale) before storing to workspace.
 
     Constraint: 2 * BLOCK_K must divide group_size.
     """
@@ -228,10 +249,10 @@ def _bf16i4_rowwise_kernel(
     if EVEN_MN and EVEN_K:
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
         ).to(tl.int32)
@@ -241,12 +262,12 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=k_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=k_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=k_mask,
@@ -259,12 +280,12 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -277,12 +298,12 @@ def _bf16i4_rowwise_kernel(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         x_odd = tl.load(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
             other=0.0,
-        ).to(tl.bfloat16)
+        )
         w_q = tl.load(
             W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
             mask=wk_mask,
@@ -306,19 +327,37 @@ def _bf16i4_rowwise_kernel(
             mask=offs_n < N,
         ).to(tl.float32)
 
+    # Upcast activations to bfloat16 for the dot product.
+    x_even = x_even.to(tl.bfloat16)
+    x_odd = x_odd.to(tl.bfloat16)
+
     # ---- main loop: compute iteration i, prefetch iteration i+1 ----
-    # The prefetch always runs (even on the last iteration where results are
-    # discarded) to avoid Triton SSA scoping issues with conditional defines.
     for k2_idx in tl.range(0, num_iters):
         k2_start = k2_slice_start + k2_idx * BLOCK_K
 
-        # Unpack and dequant current tile (uses already-loaded data)
-        w_lo = w_q & 0x0F
-        w_hi = (w_q >> 4) & 0x0F
+        # Unpack INT4 nibbles to signed integers.
+        w_lo = ((w_q & 0x0F) ^ 8) - 8
+        w_hi = (((w_q >> 4) & 0x0F) ^ 8) - 8
+
+        # Inline dequant and dot.
         s_col = s[:, None]
         z_col = z[:, None]
-        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s_col + z_col
-        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s_col + z_col
+        w_lo_dq = w_lo.to(tl.float32) * s_col + z_col
+        w_hi_dq = w_hi.to(tl.float32) * s_col + z_col
+
+        if HAS_X_SCALE:
+            # Two separate dots avoid tl.cat LDS staging (bank-conflict hot spot).
+            acc = tl.dot(
+                x_even, tl.trans(w_lo_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32
+            )
+            acc = tl.dot(
+                x_odd, tl.trans(w_hi_dq.to(tl.bfloat16)), acc, out_dtype=tl.float32
+            )
+        else:
+            # Fused cat+dot: proven faster for the BF16 activation path.
+            x_fused = tl.cat(x_even, x_odd, dim=1)
+            w_fused = tl.cat(w_lo_dq.to(tl.bfloat16), w_hi_dq.to(tl.bfloat16), dim=1)
+            acc = tl.dot(x_fused, tl.trans(w_fused), acc, out_dtype=tl.float32)
 
         # Prefetch next iteration (clamp to last valid tile on final iteration)
         next_k2_start = tl.minimum(k2_start + BLOCK_K, k2_slice_end - BLOCK_K)
@@ -328,12 +367,12 @@ def _bf16i4_rowwise_kernel(
                 X_even_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
             ).to(tl.int32)
@@ -345,14 +384,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_k_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_k_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_k_mask,
@@ -367,14 +406,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_wk_mask,
@@ -389,14 +428,14 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_x_odd = tl.load(
                 X_odd_ptr
                 + offs_m[:, None] * stride_xm
                 + next_offs_k2[None, :] * stride_xk,
                 mask=next_xk_mask,
                 other=0.0,
-            ).to(tl.bfloat16)
+            )
             next_w_q = tl.load(
                 W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
                 mask=next_wk_mask,
@@ -420,9 +459,9 @@ def _bf16i4_rowwise_kernel(
                 mask=offs_n < N,
             ).to(tl.float32)
 
-        x_fused = tl.cat(x_even, x_odd, dim=1)
-        w_fused = tl.cat(w_lo_dq.to(tl.bfloat16), w_hi_dq.to(tl.bfloat16), dim=1)
-        acc = tl.dot(x_fused, tl.trans(w_fused), acc, out_dtype=tl.float32)
+        # Upcast prefetched activations to bfloat16.
+        next_x_even = next_x_even.to(tl.bfloat16)
+        next_x_odd = next_x_odd.to(tl.bfloat16)
 
         # Rotate buffers
         x_even = next_x_even
@@ -431,10 +470,17 @@ def _bf16i4_rowwise_kernel(
         s = next_s
         z = next_z
 
+    # ---- epilogue: optional per-row activation dequant scale ----
+    if HAS_X_SCALE:
+        if EVEN_MN:
+            xs = tl.load(x_scale_ptr + offs_m).to(tl.float32)
+        else:
+            xs = tl.load(x_scale_ptr + offs_m, mask=offs_m < M, other=1.0).to(
+                tl.float32
+            )
+        acc = acc * xs[:, None]
+
     # ---- store output ----
-    # Write partial sum for this K-slice into workspace[pid_z, m, n].
-    # When SPLIT_K=1, pid_z=0 and this is a direct store to [M, N].
-    # When SPLIT_K>1, the caller launches _bf16i4_splitk_reduce to sum slices.
     y_ptrs = (
         Y_ptr
         + pid_z * stride_yz
@@ -544,11 +590,16 @@ def matmul_bf16i4_rowwise(
     # only reads slices [0:split_k] — unwritten slices beyond split_k are never touched.
     workspace = torch.empty((_MAX_SPLIT_K, M, N), dtype=torch.float32, device=X.device)
 
+    # Dummy x_scale: never read when HAS_X_SCALE=False, but Triton requires a
+    # valid pointer for every non-constexpr parameter.
+    _dummy_x_scale = torch.empty(1, dtype=torch.float32, device=X.device)
+
     _bf16i4_rowwise_kernel[grid](
         x_even,
         x_odd,
         W,
         workspace,
+        _dummy_x_scale,
         w_scale_group,
         w_zero_group,
         M,
@@ -564,6 +615,7 @@ def matmul_bf16i4_rowwise(
         1,
         w_scale_group.stride(0),
         w_scale_group.stride(1),
+        HAS_X_SCALE=False,
     )
 
     split_k = _bf16i4_rowwise_kernel.best_config.kwargs["SPLIT_K"]

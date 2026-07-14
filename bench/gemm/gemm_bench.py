@@ -47,6 +47,17 @@ COMPUTE_ROOFLINE_TFLOPS: dict[str, dict[ComputeDtype, float]] = {
         ComputeDtype.TF32: 1250.0,
         ComputeDtype.FP32: 80.0,  # non-tensorcore
     },
+    "AMD Instinct MI300X": {
+        ComputeDtype.FP8: 2610.0,
+        ComputeDtype.BF16: 1300.0,
+        ComputeDtype.TF32: 653.7,
+        ComputeDtype.FP32: 163.4,
+    },
+    "AMD Instinct MI350X": {
+        ComputeDtype.FP8: 4600.0,
+        ComputeDtype.BF16: 2300.0,
+        ComputeDtype.FP32: 144.2,
+    },
 }
 
 

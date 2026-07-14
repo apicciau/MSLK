@@ -9,6 +9,29 @@ import functools
 from enum import auto, Enum
 
 import torch
+
+# In python_only mode the C++ shared library is not loaded, so op schemas
+# that some benchmark classes reference in __init__ are missing.  Register
+# stub schemas so the module can be imported; the ops themselves will only
+# run when their backend (CUDA/Triton) is available.
+import mslk.gemm  # noqa: F401  — ensures the mslk namespace exists
+
+_STUB_SCHEMAS = [
+    (
+        "f8f8bf16_rowwise",
+        "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, "
+        "Tensor? bias=None, bool use_fast_accum=True) -> Tensor",
+    ),
+    (
+        "f8f8bf16_rowwise_preshuffle",
+        "(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, "
+        "Tensor? bias=None, bool use_fast_accum=True) -> Tensor",
+    ),
+]
+for _name, _schema in _STUB_SCHEMAS:
+    if not hasattr(torch.ops.mslk, _name):
+        torch.library.define(f"mslk::{_name}", _schema)
+
 from mslk.bench.common.utils import BenchOptions, do_bench
 from mslk.gemm.triton.fp8_gemm import matmul_fp8_block, matmul_fp8_row, to_mxfp8
 from mslk.gemm.triton.grouped_gemm import grouped_gemm, grouped_gemm_fp8_rowwise
@@ -1584,6 +1607,24 @@ class CutlassFP8Int4Rowwise(GemmOpBase):
     @property
     def weight_bytes_per_element(self) -> float:
         return 0.5  # Int4 weights
+
+
+@register_gemm_op
+class TritonFP8Int4Rowwise(CutlassFP8Int4Rowwise):
+    """ROCm Triton FP8 activations x INT4 weights rowwise GEMM."""
+
+    def compute(self, xq, wq, x_scale, w_scale, w_zp):
+        from mslk.gemm.triton.f8i4bf16_rowwise_gemm import matmul_f8i4bf16_rowwise
+
+        return matmul_f8i4bf16_rowwise(xq, wq, x_scale, w_scale, w_zp)
+
+    def quantize_and_compute(self, x, w):
+        xq, wq, x_scale, w_scale, w_zp = self.quantize(x, w)
+        return self.compute(xq, wq, x_scale, w_scale, w_zp)
+
+    @property
+    def supported_accelerators(self) -> set[Accelerator]:
+        return {Accelerator.AMD_MI300X, Accelerator.AMD_GFX950}
 
 
 @register_gemm_op
