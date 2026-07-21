@@ -188,9 +188,12 @@ def ck_preshuffle(src: torch.Tensor, NXdl: int = 16) -> torch.Tensor:
     Returns:
         torch.Tensor: The shuffled tensor.
     """
-    # Check input datatype
-    if src.dtype != torch.float8_e4m3fnuz:
-        raise TypeError("Input must be type float8_e4m3fnuz.")
+    _fp8_dtypes = {torch.float8_e4m3fnuz, torch.float8_e4m3fn}
+    if src.dtype not in _fp8_dtypes:
+        raise TypeError(
+            f"Input must be an FP8 type ({', '.join(str(d) for d in _fp8_dtypes)}), "
+            f"got {src.dtype}."
+        )
     N, K = src.shape
     KPack = 16
     NLane = NXdl
