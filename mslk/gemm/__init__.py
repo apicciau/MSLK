@@ -40,3 +40,8 @@ if torch.version.hip is not None:
         mx8mx4_gemm,
         mx8mx8_gemm,
     )
+
+    from mslk.utils.flydsl import is_flydsl_available
+
+    if is_flydsl_available():
+        from .flydsl import f8f8bf16_blockwise  # noqa: F401

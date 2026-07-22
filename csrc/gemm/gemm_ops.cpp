@@ -123,7 +123,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 
 #if !defined(USE_MTIA)
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
+#ifndef USE_ROCM
+  // On ROCm, f8f8bf16_blockwise is dispatched to the FlyDSL kernel
+  // registered by mslk.gemm.flydsl.f8f8bf16_blockwise via
+  // torch.library.impl at Python import time.
   m.impl("f8f8bf16_blockwise", f8f8bf16_blockwise);
+#endif
   m.impl("f8f8bf16_rowwise", f8f8bf16_rowwise);
   m.impl("f8f8bf16_rowwise_out", f8f8bf16_rowwise_out);
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);
