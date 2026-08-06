@@ -134,3 +134,49 @@ if is_flydsl_available():
         )
 
         return Y
+
+    @torch.library.impl("mslk::f8f8bf16_blockwise_preshuffle", "CUDA")
+    def _f8f8bf16_blockwise_preshuffle_flydsl(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        block_m: int = 128,
+        block_n: int = 128,
+        block_k: int = 128,
+    ) -> torch.Tensor:
+        assert block_m == 128 and block_n == 128 and block_k == 128, (
+            "Only block_size=128 is supported"
+        )
+
+        M = XQ.shape[0] if XQ.dim() == 2 else XQ[..., 0:1].numel()
+        K = XQ.shape[-1]
+        N = WQ.shape[0] if WQ.dim() == 2 else WQ[..., 0:1].numel()
+
+        out_sizes = list(XQ.shape)
+        out_sizes[-1] = N
+        Y = torch.empty(out_sizes, dtype=torch.bfloat16, device=XQ.device)
+
+        if M == 0 or N == 0 or K == 0:
+            return Y
+
+        XQ_2d = XQ.view(-1, K)
+        WQ_2d = WQ.view(-1, K)
+        Y_2d = Y.view(-1, N)
+        M = XQ_2d.shape[0]
+
+        scale_block_k = block_k
+        tile_m, tile_n, tile_k = _select_tile_config(M, N, K, scale_block_k)
+
+        launcher = _get_compiled_kernel(M, N, K, tile_m, tile_n, tile_k, scale_block_k)
+
+        x_scale_flat = x_scale.contiguous().view(-1)
+        w_scale_flat = w_scale.contiguous().view(-1)
+
+        run_compiled(
+            launcher,
+            Y_2d, XQ_2d, WQ_2d, x_scale_flat, w_scale_flat,
+            M, N, torch.cuda.current_stream(),
+        )
+
+        return Y
