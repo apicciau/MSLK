@@ -19,8 +19,6 @@ import torch
 from mslk.utils.flydsl import is_flydsl_available, run_compiled
 
 if is_flydsl_available():
-    import flydsl.compiler as flyc
-
     from mslk.gemm.flydsl.blockscale_preshuffle_gemm import (
         compile_blockscale_preshuffle_gemm,
     )

@@ -69,7 +69,6 @@ def compile_blockscale_preshuffle_gemm(
         )
 
     scale_k = K // scale_block_k
-    scale_m = (M + scale_block_m - 1) // scale_block_m
     sb_per_tile = tile_k // scale_block_k
     ku_per_sb = scale_block_k // 64
 
@@ -119,7 +118,6 @@ def compile_blockscale_preshuffle_gemm(
     b_load_bytes = 16
     num_b_loads = bytes_per_thread_b // b_load_bytes
 
-    wave_size = 64
     num_a_async_loads = bytes_per_thread_a // a_async_load_bytes
 
     lds_stride_bytes = tile_k_bytes
@@ -170,7 +168,6 @@ def compile_blockscale_preshuffle_gemm(
         i32_m: fx.Int32,
         i32_n: fx.Int32,
     ):
-        c_m = arith.index_cast(T.index, i32_m)
         c_n = arith.index_cast(T.index, i32_n)
 
         acc_init = arith.constant_vector(0.0, T.f32x4)
@@ -811,7 +808,6 @@ def compile_blockscale_preshuffle_gemm(
                 a0_prefetch_pong = prefetch_a0_pack(lds_a_pong)
 
             last_k = arith.index(K - tile_k)
-            second_last_k = arith.index(K - tile_k * 2)
 
             _load_a_to_lds(last_k, lds_a_ping)
             b_tile_ping = prefetch_b_tile(last_k)
