@@ -44,6 +44,7 @@ if torch.version.hip is not None:
     )
 
     if is_flydsl_available():
+        from .flydsl import f8f8bf16_blockwise  # noqa: F401
         # Registers mslk::f8f8bf16_groupwise_grouped and its _preshuffle
         # sibling (FlyDSL).
         from .flydsl import (  # noqa: F401

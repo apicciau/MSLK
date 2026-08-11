@@ -76,6 +76,8 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
       "f8f8bf16_rowwise_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
   m.def(
       "f8f8f16_rowwise_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? bias=None, bool use_fast_accum=True) -> Tensor");
+  m.def(
+      "f8f8bf16_blockwise_preshuffle(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, int block_m=128, int block_n=128, int block_k=128) -> Tensor");
   // Generic PyTorch grouped GEMM API is only available on AMD for now.
   m.def(
       "f8f8bf16_rowwise_grouped_mm(Tensor XQ, Tensor WQ, Tensor x_scale, Tensor w_scale, Tensor? offsets, Tensor(a!) output) -> Tensor");
@@ -129,7 +131,12 @@ TORCH_LIBRARY_FRAGMENT(mslk, m) {
 
 #if !defined(USE_MTIA)
 TORCH_LIBRARY_IMPL(mslk, CUDA, m) {
+#ifndef USE_ROCM
+  // On ROCm, f8f8bf16_blockwise is dispatched to the FlyDSL kernel
+  // registered by mslk.gemm.flydsl.f8f8bf16_blockwise via
+  // torch.library.impl at Python import time.
   m.impl("f8f8bf16_blockwise", f8f8bf16_blockwise);
+#endif
   m.impl("f8f8bf16_rowwise", f8f8bf16_rowwise);
   m.impl("f8f8bf16_rowwise_out", f8f8bf16_rowwise_out);
   m.impl("f8f8bf16_rowwise_batched", f8f8bf16_rowwise_batched);

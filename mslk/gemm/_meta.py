@@ -110,6 +110,34 @@ if hasattr(torch.ops.mslk, "f8f8bf16_blockwise"):
             return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
 
 
+if hasattr(torch.ops.mslk, "f8f8bf16_blockwise_preshuffle"):
+
+    @torch.library.register_fake("mslk::f8f8bf16_blockwise_preshuffle")
+    def f8f8bf16_blockwise_preshuffle_meta(
+        XQ: torch.Tensor,
+        WQ: torch.Tensor,
+        x_scale: torch.Tensor,
+        w_scale: torch.Tensor,
+        block_m: int = 128,
+        block_n: int = 128,
+        block_k: int = 128,
+    ) -> torch.Tensor:
+        x_dims = XQ.dim()
+        w_dims = WQ.dim()
+        assert (x_dims == 2 or x_dims == 3) and (w_dims == 2), (
+            "The dim of XQ must be 2 or 3, and dim of WQ must be 2"
+        )
+        if x_dims == 2:
+            M = XQ.shape[0]
+            N = WQ.shape[0]
+            return torch.empty((M, N), dtype=torch.bfloat16, device=XQ.device)
+        else:
+            B = XQ.shape[0]
+            M = XQ.shape[1]
+            N = WQ.shape[0]
+            return torch.empty((B, M, N), dtype=torch.bfloat16, device=XQ.device)
+
+
 if hasattr(torch.ops.mslk, "f8f8bf16_rowwise_grouped_stacked"):
 
     @torch.library.register_fake("mslk::f8f8bf16_rowwise_grouped_stacked")
