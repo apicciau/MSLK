@@ -16,7 +16,8 @@ scale_a [scale_m, scale_k] M-outer row-major, scale_b [scale_n, scale_k].
 
 import torch
 
-from mslk.utils.flydsl import is_flydsl_available, run_compiled
+from mslk.flydsl.common import is_flydsl_available
+from mslk.flydsl.jit import run_compiled
 
 if is_flydsl_available():
     from mslk.gemm.flydsl.blockscale_preshuffle_gemm import (

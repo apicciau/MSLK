@@ -241,6 +241,8 @@ def preshuffle_b_mfma(src: torch.Tensor) -> torch.Tensor:
     lead = src.shape[:-2]
     src = src.reshape(*lead, N // NLane, NLane, K0, KLane, KPack)
     ndim = src.ndim
+    # Permute only the trailing 5 dims: (N0, NLane, K0, KLane, KPack) ->
+    # (N0, K0, KLane, NLane, KPack), keeping any leading group dim in place.
     lead_axes = tuple(range(ndim - 5))
     n0, nlane, k0, klane, kpack = range(ndim - 5, ndim)
     dst = src.permute(*lead_axes, n0, k0, klane, nlane, kpack).contiguous()

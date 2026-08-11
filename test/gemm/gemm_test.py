@@ -9,21 +9,36 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 from typing import Optional, Union
 
 import mslk.gemm  # noqa: F401
 import mslk.quantize  # noqa: F401
 import torch
 import triton  # noqa: F401
+from mslk.flydsl.common import (
+    flydsl_version,
+    is_flydsl_version_at_least,
+    MIN_FLYDSL_VERSION,
+)
+from mslk.gemm.fp4_autograd import (
+    _F4F4BF16,
+    _F4F4BF16GroupedMM,
+    f4f4bf16 as f4f4bf16_autograd,
+    f4f4bf16_grouped_mm as f4f4bf16_grouped_mm_autograd,
+    f4f4bf16_ultra_grouped_mm as f4f4bf16_ultra_grouped_mm_autograd,
+)
 from mslk.quantize.triton.fp4_quantize import (
     _to_blocked,
     calculate_group_max,
-    get_nvfp4_global_scales_naive,
     nvfp4_quantize_stacked,
     nvfp4_quantize_stacked_with_token_scale,
-    quantize_nvfp4_naive,
     triton_quantize_mx4_unpack,
+    triton_quantize_nvfp4,
 )
+from mslk.quantize.triton.fp4_utils import global_scale_nvfp4
+from mslk.quantize.triton.legacy.fp4_utils import dequantize_nvfp4, fp4_to_float
+from mslk.quantize.triton.legacy.primitives import _from_blocked
 from mslk.testing.device import (
     skipUnlessCuda,
     skipUnlessCudaCapability,
@@ -888,18 +903,30 @@ class FP8GroupwiseTests(unittest.TestCase):
 
     @parameterized.expand(
         [
-            # (m_values, N, K)
-            ([128, 64], 128, 256),  # small, 2 groups
-            ([512, 256, 128], 256, 512),  # medium, 3 groups
-            ([1, 128, 256], 128, 256),  # decode + prefill mix
-            ([2048, 1024], 512, 512),  # large, 2 groups
+            (*case, preshuffle)
+            for preshuffle in [False, True]
+            for case in [
+                # (m_values, N, K)
+                ([128, 64], 128, 256),  # small, 2 groups
+                ([512, 256, 128], 256, 512),  # medium, 3 groups
+                ([1, 128, 256], 128, 256),  # decode + prefill mix
+                ([2048, 1024], 512, 512),  # large, 2 groups
+            ]
         ]
     )
-    def test_f8f8bf16_groupwise_grouped(self, m_values: list, N: int, K: int) -> None:
+    def test_f8f8bf16_groupwise_grouped(
+        self, m_values: list, N: int, K: int, preshuffle: bool
+    ) -> None:
+        # FlyDSL backs both variants on ROCm, and the preshuffle op exists only
+        # there, so skip when it is unavailable.
+        from mslk.flydsl.common import is_flydsl_available
         from mslk.quantize.triton.fp8_quantize import (
             quantize_fp8_block,
             quantize_fp8_group,
         )
+
+        if (preshuffle or torch.version.hip is not None) and not is_flydsl_available():
+            self.skipTest("FlyDSL not available")
 
         G = len(m_values)
         device = self.device
@@ -925,9 +952,18 @@ class FP8GroupwiseTests(unittest.TestCase):
         # Quantize activations: xq [TotalM, K], x_scale [K//128, TotalM].
         xq, x_scale = quantize_fp8_group(x, m_sizes=m_sizes)
 
-        out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
-            xq, wq, x_scale, w_scale, m_sizes
-        )
+        if preshuffle:
+            from mslk.quantize.shuffle import preshuffle_b_mfma
+
+            # The preshuffle op consumes weights already in the MFMA B layout;
+            # callers shuffle once at prep time.
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped_preshuffle(
+                xq, preshuffle_b_mfma(wq), x_scale, w_scale, m_sizes
+            )
+        else:
+            out = torch.ops.mslk.f8f8bf16_groupwise_grouped(
+                xq, wq, x_scale, w_scale, m_sizes
+            )
 
         # BF16 reference: compute per group and concatenate.
         ref_parts = []
@@ -939,7 +975,7 @@ class FP8GroupwiseTests(unittest.TestCase):
 
         self.assertFalse(out.isnan().any().item(), "Output contains NaN")
         self.assertFalse(out.isinf().any().item(), "Output contains Inf")
-        torch.testing.assert_close(out, ref, atol=8.0e-2, rtol=8.0e-2)
+        torch.testing.assert_close(out, ref, atol=1.0e-2, rtol=4.0e-2)
 
 
 @skipUnlessCuda()
@@ -2290,15 +2326,14 @@ class NVFP4Tests(unittest.TestCase):
         A = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
         B = torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
 
-        global_scales, a_global_scales, b_global_scales = get_nvfp4_global_scales_naive(
-            [A],
-            [B],
-        )
-        aqs, a_scales = quantize_nvfp4_naive([A], a_global_scales)
-        bqs, b_scales = quantize_nvfp4_naive([B], b_global_scales)
+        a_global_scale = global_scale_nvfp4(A)
+        b_global_scale = global_scale_nvfp4(B)
+        aq, a_scale = triton_quantize_nvfp4(A, a_global_scale)
+        bq, b_scale = triton_quantize_nvfp4(B, b_global_scale)
+        global_scale = torch.reciprocal(a_global_scale * b_global_scale)
 
         out_nvfp4 = torch.ops.mslk.f4f4bf16(
-            aqs[0], bqs[0], a_scales[0], b_scales[0], None, global_scales[0]
+            aq, bq, a_scale, b_scale, None, global_scale
         )
         out_bf16 = A @ B.t()
 
@@ -2329,20 +2364,19 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
-        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=0)
         W = torch.stack(WS, dim=0)
+        m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(X, m_sizes)
+        w_cat = W.reshape(G * N, K)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        xq, x_scale = nvfp4_quantize_stacked(m_sizes, X, x_global_scale)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2379,20 +2413,27 @@ class NVFP4Tests(unittest.TestCase):
         ]
         offsets = torch.arange(K, G * (K + 1), K, dtype=torch.int32, device=self.device)
 
-        global_scales, x_global_scales, w_global_scales = get_nvfp4_global_scales_naive(
-            XS, WS
-        )
-        xqs, x_scales = quantize_nvfp4_naive(XS, x_global_scales)
-        wqs, w_scales = quantize_nvfp4_naive(WS, w_global_scales)
-
-        xq = torch.cat(xqs, dim=1).view(torch.float4_e2m1fn_x2)
-        wq = torch.cat(wqs, dim=1).view(torch.float4_e2m1fn_x2)
-        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e4m3fn)
-        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e4m3fn)
-        global_scale = torch.stack(global_scales, dim=0)
-
         X = torch.cat(XS, dim=1)
         W = torch.cat(WS, dim=1)
+        x_stacked = torch.cat(XS, dim=0)
+        w_stacked = torch.cat(WS, dim=0)
+        x_m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(x_stacked, x_m_sizes)
+        w_global_scale, _ = calculate_group_max(w_stacked, w_m_sizes)
+        xq_stacked, x_scale_2d = nvfp4_quantize_stacked(
+            x_m_sizes, x_stacked, x_global_scale
+        )
+        wq_stacked, w_scale_2d = nvfp4_quantize_stacked(
+            w_m_sizes, w_stacked, w_global_scale
+        )
+        xq = xq_stacked.view(G, M, K // 2).transpose(0, 1).reshape(M, G * K // 2)
+        wq = wq_stacked.view(G, N, K // 2).transpose(0, 1).reshape(N, G * K // 2)
+        padded_M = triton.cdiv(M, 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
+        x_scale = x_scale_2d[: G * padded_M].view(G, padded_M, -1)
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
 
         out_bf16 = torch._grouped_mm(
             X, W.transpose(-2, -1), offs=offsets, out_dtype=torch.bfloat16
@@ -2427,7 +2468,7 @@ class NVFP4Tests(unittest.TestCase):
             w_global_scale,
         )
         wq = wq.view(G, N, K // 2)
-        padded_N = ((N + 127) // 128) * 128
+        padded_N = triton.cdiv(N, 128) * 128
         w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
         w_global_scale_inv = torch.reciprocal(w_global_scale)
 
@@ -3343,6 +3384,513 @@ class RocmInt8GemmTests(unittest.TestCase):
         ref = self._reference_bf16(XQ, WQ, scale)
         self.assertEqual(out.dtype, torch.bfloat16)
         torch.testing.assert_close(out, ref, atol=1.0, rtol=1e-2)
+
+
+@skipUnlessRocm()
+@skipUnlessGfxArch("gfx950")
+@unittest.skipUnless(
+    is_flydsl_version_at_least(),
+    f"requires FlyDSL >= {MIN_FLYDSL_VERSION}, found {flydsl_version()}",
+)
+class FlyDSLPreshuffleGemmTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+        from mslk.gemm.flydsl import flydsl_preshuffle, flydsl_preshuffle_gemm
+
+        cls.flydsl_preshuffle = staticmethod(flydsl_preshuffle)
+        cls.flydsl_preshuffle_gemm = staticmethod(flydsl_preshuffle_gemm)
+
+    @parameterized.expand(
+        [
+            (1, 8192, 1024),
+            (32, 1280, 8192),
+            (128, 7424, 8192),
+            (1024, 8192, 1024),
+            (4096, 1280, 8192),
+        ]
+    )
+    def test_gemm(self, M: int, N: int, K: int) -> None:
+        x = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = quantize_fp8_row(x)
+        wq, w_scale = quantize_fp8_row(w)
+        wq_shuffled = self.flydsl_preshuffle(wq)
+
+        out = self.flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+
+        ref = (x @ w.T).to(torch.bfloat16)
+        torch.testing.assert_close(out, ref, atol=1.0, rtol=0.1)
+
+
+# ---------------------------------------------------------------------------
+# FP4 backward (autograd) helpers & tests
+# ---------------------------------------------------------------------------
+
+
+def _ref_dequantize_mxfp4(
+    xq: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Reference MXFP4 dequantization for backward tests."""
+    xq_u8 = xq.view(torch.uint8)
+    M = xq_u8.shape[0]
+    K = xq_u8.shape[1] * 2
+    x_float = fp4_to_float(xq_u8)
+    num_groups = K // block_size
+    scale_flat = _from_blocked(scale.reshape(-1).view(torch.uint8), (M, num_groups))
+    scale_float = torch.exp2(scale_flat.view(torch.uint8).to(torch.float32) - 127.0)
+    x_scaled = (
+        x_float.view(M, num_groups, block_size) * scale_float.view(M, num_groups, 1)
+    ).view(M, K)
+    return x_scaled.to(torch.bfloat16)
+
+
+def _ref_dequantize_nvfp4(
+    xq: torch.Tensor,
+    scale: torch.Tensor,
+    global_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Reference NVFP4 dequantization for backward tests."""
+    return dequantize_nvfp4(xq.view(torch.uint8), scale, global_scale, group_size=16)
+
+
+@skipUnlessGfxArch("gfx950")
+@skipUnlessCudaCapability(10)
+class MXFP4BackwardTests(unittest.TestCase):
+    """Backward (autograd) tests for f4f4bf16 with MXFP4 format."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _run_backward_test(self, M: int, N: int, K: int) -> None:
+        X = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale = triton_quantize_mx4_unpack(X, group_size=32)
+        wq, w_scale = triton_quantize_mx4_unpack(W, group_size=32)
+
+        # Drive the actual autograd wrapper, not a plain BF16 matmul.
+        out = f4f4bf16_autograd(xq, wq, x_scale, w_scale)
+        grad_out = torch.randn_like(out)
+
+        # Packed FP4 (uint8) inputs cannot require grad, so invoke the
+        # autograd.Function backward directly to exercise its grad math.
+        ctx = SimpleNamespace(
+            saved_tensors=(xq, wq, x_scale, w_scale),
+            global_scale=None,
+            mxfp4_block_size=32,
+        )
+        grad_X, grad_W, *rest = _F4F4BF16.backward(ctx, grad_out)
+
+        self.assertTrue(grad_X.isfinite().all(), "grad_X has non-finite values")
+        self.assertTrue(grad_W.isfinite().all(), "grad_W has non-finite values")
+        self.assertEqual(grad_X.shape, (M, K))
+        self.assertEqual(grad_W.shape, (N, K))
+        self.assertTrue(all(r is None for r in rest))
+
+        # Reference: dequantize to BF16 and take the standard matmul grads.
+        X_deq = _ref_dequantize_mxfp4(xq, x_scale, block_size=32)
+        W_deq = _ref_dequantize_mxfp4(wq, w_scale, block_size=32)
+        torch.testing.assert_close(
+            grad_X,
+            grad_out @ W_deq,
+            atol=1e-2,
+            rtol=1e-2,
+            msg="grad_X does not match reference",
+        )
+        torch.testing.assert_close(
+            grad_W,
+            grad_out.t() @ X_deq,
+            atol=1e-2,
+            rtol=1e-2,
+            msg="grad_W does not match reference",
+        )
+
+    @parameterized.expand(
+        [
+            (64, 128, 256),
+            (256, 512, 1024),
+            (1024, 2048, 1024),
+            (128, 256, 512),  # non-square
+        ]
+    )
+    def test_backward(self, M: int, N: int, K: int) -> None:
+        self._run_backward_test(M, N, K)
+
+    def test_gradient_flow_nonzero(self) -> None:
+        """Gradients out of the FP4 autograd wrapper are non-zero."""
+        M, N, K = 64, 128, 256
+        X = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        xq, x_scale = triton_quantize_mx4_unpack(X, group_size=32)
+        wq, w_scale = triton_quantize_mx4_unpack(W, group_size=32)
+
+        out = f4f4bf16_autograd(xq, wq, x_scale, w_scale)
+        ctx = SimpleNamespace(
+            saved_tensors=(xq, wq, x_scale, w_scale),
+            global_scale=None,
+            mxfp4_block_size=32,
+        )
+        grad_X, grad_W, *_ = _F4F4BF16.backward(ctx, torch.ones_like(out))
+        self.assertGreater(grad_X.abs().max().item(), 0.0)
+        self.assertGreater(grad_W.abs().max().item(), 0.0)
+
+    def test_dequant_round_trip(self) -> None:
+        """Quantize → dequant round trip should be close to original."""
+        M, K = 128, 1024
+        X = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        xq, x_scale = triton_quantize_mx4_unpack(X, group_size=32)
+        X_deq = _ref_dequantize_mxfp4(xq, x_scale, block_size=32)
+        self.assertEqual(X_deq.shape, (M, K))
+        self.assertEqual(X_deq.dtype, torch.bfloat16)
+        self.assertTrue(X_deq.isfinite().all())
+        torch.testing.assert_close(X_deq, X, atol=0.15, rtol=0.15)
+
+    def test_f4f4bf16_wrapper_forward_matches_op(self) -> None:
+        """The autograd wrapper forward equals the raw f4f4bf16 op (MXFP4)."""
+        M, N, K = 256, 512, 1024
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        aq, a_scale = triton_quantize_mx4_unpack(A)
+        bq, b_scale = triton_quantize_mx4_unpack(B)
+
+        out_wrapped = f4f4bf16_autograd(aq, bq, a_scale, b_scale)
+        out_raw = torch.ops.mslk.f4f4bf16(aq, bq, a_scale, b_scale, None, None, 32)
+        torch.testing.assert_close(out_wrapped, out_raw)
+
+    def test_f4f4bf16_wrapper_backward_matches_reference(self) -> None:
+        """The wrapper backward returns dequantize-then-matmul BF16 grads (MXFP4)."""
+        M, N, K = 256, 512, 1024
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        aq, a_scale = triton_quantize_mx4_unpack(A)
+        bq, b_scale = triton_quantize_mx4_unpack(B)
+
+        # Forward through the autograd.Function wrapper.
+        out = f4f4bf16_autograd(aq, bq, a_scale, b_scale)
+        grad_out = torch.randn_like(out)
+
+        # Packed FP4 (uint8) inputs cannot require grad, so drive the
+        # autograd.Function backward directly to exercise its grad math.
+        ctx = SimpleNamespace(
+            saved_tensors=(aq, bq, a_scale, b_scale),
+            global_scale=None,
+            mxfp4_block_size=32,
+        )
+        grad_X, grad_W, *rest = _F4F4BF16.backward(ctx, grad_out)
+
+        A_deq = _ref_dequantize_mxfp4(aq, a_scale, block_size=32)
+        B_deq = _ref_dequantize_mxfp4(bq, b_scale, block_size=32)
+        torch.testing.assert_close(grad_X, grad_out @ B_deq, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(grad_W, grad_out.t() @ A_deq, atol=1e-2, rtol=1e-2)
+        self.assertEqual(grad_X.shape, (M, K))
+        self.assertEqual(grad_W.shape, (N, K))
+        self.assertTrue(all(r is None for r in rest))
+
+    def test_grouped_mm_wrapper_forward_matches_op(self) -> None:
+        """Grouped-MM wrapper forward equals the raw op (MXFP4, 2D-3D)."""
+        G, M, N, K = 4, 256, 512, 1024
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq_g, xs_g = triton_quantize_mx4_unpack(x)
+            wq_g, ws_g = triton_quantize_mx4_unpack(w)
+            xqs.append(xq_g)
+            wqs.append(wq_g)
+            x_scales.append(xs_g)
+            w_scales.append(ws_g)
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        out_wrapped = f4f4bf16_grouped_mm_autograd(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets
+        )
+        out_raw = torch.ops.mslk.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets, None, None
+        )
+        torch.testing.assert_close(out_wrapped, out_raw)
+
+    def test_grouped_mm_wrapper_backward_matches_reference(self) -> None:
+        """Grouped-MM wrapper backward matches per-group BF16 grads (MXFP4, 2D-3D)."""
+        G, M, N, K = 4, 256, 512, 1024
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+        xqs, wqs, x_scales, w_scales = [], [], [], []
+        for x, w in zip(XS, WS):
+            xq_g, xs_g = triton_quantize_mx4_unpack(x)
+            wq_g, ws_g = triton_quantize_mx4_unpack(w)
+            xqs.append(xq_g)
+            wqs.append(wq_g)
+            x_scales.append(xs_g)
+            w_scales.append(ws_g)
+        xq = torch.cat(xqs, dim=0).view(torch.float4_e2m1fn_x2)
+        wq = torch.stack(wqs, dim=0).view(torch.float4_e2m1fn_x2)
+        x_scale = torch.stack(x_scales, dim=0).view(torch.float8_e8m0fnu)
+        w_scale = torch.stack(w_scales, dim=0).view(torch.float8_e8m0fnu)
+
+        # WQ is passed column-major as (G, K/2, N).
+        WQ = wq.transpose(-2, -1)
+        out = f4f4bf16_grouped_mm_autograd(xq, WQ, x_scale, w_scale, offsets)
+        grad_out = torch.randn_like(out)
+
+        ctx = SimpleNamespace(
+            saved_tensors=(xq, WQ, x_scale, w_scale, offsets),
+            global_scale=None,
+        )
+        grad_X, grad_W, *rest = _F4F4BF16GroupedMM.backward(ctx, grad_out)
+
+        self.assertEqual(grad_X.shape, (G * M, K))
+        # Gradient for WQ must match WQ's own (G, K, N) layout.
+        self.assertEqual(grad_W.shape, (G, K, N))
+        self.assertTrue(grad_X.isfinite().all())
+        self.assertTrue(grad_W.isfinite().all())
+        self.assertTrue(all(r is None for r in rest))
+
+        for g in range(G):
+            start, end = g * M, (g + 1) * M
+            X_g = _ref_dequantize_mxfp4(xqs[g], x_scales[g], block_size=32)
+            W_g = _ref_dequantize_mxfp4(wqs[g], w_scales[g], block_size=32)
+            dY_g = grad_out[start:end]
+            torch.testing.assert_close(
+                grad_X[start:end], dY_g @ W_g, atol=1e-2, rtol=1e-2
+            )
+            torch.testing.assert_close(grad_W[g], X_g.t() @ dY_g, atol=1e-2, rtol=1e-2)
+
+    def test_grouped_mm_backward_rejects_2d_weights(self) -> None:
+        """2D-2D grouped backward is unimplemented and must fail loudly."""
+        ctx = SimpleNamespace(
+            saved_tensors=(
+                torch.zeros(8, 8, dtype=torch.uint8, device=self.device),
+                torch.zeros(8, 8, dtype=torch.uint8, device=self.device),
+                torch.zeros(8, dtype=torch.uint8, device=self.device),
+                torch.zeros(8, dtype=torch.uint8, device=self.device),
+                torch.tensor([8], dtype=torch.int32, device=self.device),
+            ),
+            global_scale=None,
+        )
+        grad_out = torch.zeros(1, 8, 8, dtype=torch.bfloat16, device=self.device)
+        with self.assertRaises(NotImplementedError):
+            _F4F4BF16GroupedMM.backward(ctx, grad_out)
+
+
+@skipUnlessCuda()
+@skipUnlessCudaCapability(10)
+class NVFP4BackwardTests(unittest.TestCase):
+    """Backward (autograd) tests for f4f4bf16 with NVFP4 format."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.accelerator.current_accelerator()
+
+    def _run_backward_test(self, M: int, N: int, K: int) -> None:
+        X = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+
+        xq, x_scale, wq, w_scale, global_scale = self._quantize_nvfp4_pair(X, W)
+
+        # Drive the actual autograd wrapper, not a plain BF16 matmul.
+        out = f4f4bf16_autograd(xq, wq, x_scale, w_scale, None, global_scale)
+        grad_out = torch.randn_like(out)
+
+        # Packed FP4 (uint8) inputs cannot require grad, so invoke the
+        # autograd.Function backward directly to exercise its grad math.
+        ctx = SimpleNamespace(
+            saved_tensors=(xq, wq, x_scale, w_scale),
+            global_scale=global_scale,
+            mxfp4_block_size=32,
+        )
+        grad_X, grad_W, *rest = _F4F4BF16.backward(ctx, grad_out)
+
+        self.assertTrue(grad_X.isfinite().all(), "grad_X has non-finite values")
+        self.assertTrue(grad_W.isfinite().all(), "grad_W has non-finite values")
+        self.assertEqual(grad_X.shape, (M, K))
+        self.assertEqual(grad_W.shape, (N, K))
+        self.assertTrue(all(r is None for r in rest))
+
+        X_deq = _ref_dequantize_nvfp4(xq, x_scale, global_scale)
+        W_deq = _ref_dequantize_nvfp4(wq, w_scale, global_scale)
+        torch.testing.assert_close(
+            grad_X,
+            grad_out @ W_deq,
+            atol=1e-2,
+            rtol=1e-2,
+            msg="grad_X does not match reference",
+        )
+        torch.testing.assert_close(
+            grad_W,
+            grad_out.t() @ X_deq,
+            atol=1e-2,
+            rtol=1e-2,
+            msg="grad_W does not match reference",
+        )
+
+    @parameterized.expand(
+        [
+            (64, 256, 2048),
+            (250, 512, 2048),
+            (128, 1024, 3584),  # non-square
+        ]
+    )
+    def test_backward(self, M: int, N: int, K: int) -> None:
+        self._run_backward_test(M, N, K)
+
+    def test_dequant_round_trip(self) -> None:
+        """Quantize → dequant round trip for NVFP4."""
+        M, K = 128, 1024
+        X = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        x_global_scale = global_scale_nvfp4(X)
+        xq, x_scale = triton_quantize_nvfp4(X, x_global_scale)
+        X_deq = _ref_dequantize_nvfp4(xq, x_scale, x_global_scale)
+        self.assertEqual(X_deq.shape, (M, K))
+        self.assertEqual(X_deq.dtype, torch.bfloat16)
+        self.assertTrue(X_deq.isfinite().all())
+        torch.testing.assert_close(X_deq, X, atol=0.15, rtol=0.15)
+
+    def _quantize_nvfp4_pair(self, A, B):
+        a_global_scale = global_scale_nvfp4(A)
+        b_global_scale = global_scale_nvfp4(B)
+        aq, a_scale = triton_quantize_nvfp4(A, a_global_scale)
+        bq, b_scale = triton_quantize_nvfp4(B, b_global_scale)
+        global_scale = torch.reciprocal(a_global_scale * b_global_scale)
+        return aq, a_scale, bq, b_scale, global_scale
+
+    def test_f4f4bf16_wrapper_forward_matches_op(self) -> None:
+        """The autograd wrapper forward equals the raw f4f4bf16 op (NVFP4)."""
+        M, N, K = 256, 512, 2048
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        aq, a_scale, bq, b_scale, global_scale = self._quantize_nvfp4_pair(A, B)
+
+        out_wrapped = f4f4bf16_autograd(aq, bq, a_scale, b_scale, None, global_scale)
+        out_raw = torch.ops.mslk.f4f4bf16(
+            aq, bq, a_scale, b_scale, None, global_scale, 32
+        )
+        torch.testing.assert_close(out_wrapped, out_raw)
+
+    def test_f4f4bf16_wrapper_backward_matches_reference(self) -> None:
+        """The wrapper backward returns dequantize-then-matmul BF16 grads (NVFP4)."""
+        M, N, K = 256, 512, 2048
+        A = torch.randn(M, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        B = torch.randn(N, K, dtype=torch.bfloat16, device=self.device) * 0.01
+        aq, a_scale, bq, b_scale, global_scale = self._quantize_nvfp4_pair(A, B)
+
+        out = f4f4bf16_autograd(aq, bq, a_scale, b_scale, None, global_scale)
+        grad_out = torch.randn_like(out)
+
+        # Packed FP4 (uint8) inputs cannot require grad, so drive the
+        # autograd.Function backward directly to exercise its grad math.
+        ctx = SimpleNamespace(
+            saved_tensors=(aq, bq, a_scale, b_scale),
+            global_scale=global_scale,
+            mxfp4_block_size=32,
+        )
+        grad_X, grad_W, *rest = _F4F4BF16.backward(ctx, grad_out)
+
+        A_deq = _ref_dequantize_nvfp4(aq, a_scale, global_scale)
+        B_deq = _ref_dequantize_nvfp4(bq, b_scale, global_scale)
+        torch.testing.assert_close(grad_X, grad_out @ B_deq, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(grad_W, grad_out.t() @ A_deq, atol=1e-2, rtol=1e-2)
+        self.assertEqual(grad_X.shape, (M, K))
+        self.assertEqual(grad_W.shape, (N, K))
+        self.assertTrue(all(r is None for r in rest))
+
+    def test_grouped_mm_wrapper_forward_matches_op(self) -> None:
+        """Grouped-MM wrapper forward equals the raw op (NVFP4, 2D-3D)."""
+        G, M, N, K = 4, 256, 512, 2048
+        XS = [
+            torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+            for _ in range(G)
+        ]
+        WS = [
+            torch.randn((N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+            for _ in range(G)
+        ]
+        offsets = torch.arange(M, G * (M + 1), M, dtype=torch.int32, device=self.device)
+        X = torch.cat(XS, dim=0)
+        W = torch.stack(WS, dim=0)
+        m_sizes = torch.full((G,), M, dtype=torch.int64, device=self.device)
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        x_global_scale, _ = calculate_group_max(X, m_sizes)
+        w_cat = W.reshape(G * N, K)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        xq, x_scale = nvfp4_quantize_stacked(m_sizes, X, x_global_scale)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        global_scale = torch.reciprocal(x_global_scale * w_global_scale)
+
+        out_wrapped = f4f4bf16_grouped_mm_autograd(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets, None, global_scale
+        )
+        out_raw = torch.ops.mslk.f4f4bf16_grouped_mm(
+            xq, wq.transpose(-2, -1), x_scale, w_scale, offsets, None, global_scale
+        )
+        torch.testing.assert_close(out_wrapped, out_raw)
+
+    @skipUnlessCudaVersion(13)
+    @skipUnlessCudaCapability(10, minor_min=3)
+    def test_ultra_grouped_mm_wrapper_forward_matches_op(self) -> None:
+        """Ultra-grouped-MM wrapper forward equals the raw op (NVFP4, 2D-3D)."""
+        G, N, K = 2, 512, 1024
+        m_sizes_list = [128, 256]
+        m_sizes = torch.tensor(m_sizes_list, dtype=torch.int64, device=self.device)
+        offsets = torch.cumsum(m_sizes, dim=0).to(torch.int32)
+        M = sum(m_sizes_list)
+        X = torch.randn((M, K), dtype=torch.bfloat16, device=self.device) * 0.1
+        W = torch.randn((G, N, K), dtype=torch.bfloat16, device=self.device) * 0.01
+        w_cat = W.reshape(G * N, K).contiguous()
+        w_m_sizes = torch.full((G,), N, dtype=torch.int64, device=self.device)
+        w_global_scale, _ = calculate_group_max(w_cat, w_m_sizes)
+        wq, w_scale_2d = nvfp4_quantize_stacked(w_m_sizes, w_cat, w_global_scale)
+        wq = wq.view(G, N, K // 2)
+        padded_N = triton.cdiv(N, 128) * 128
+        w_scale = w_scale_2d[: G * padded_N].view(G, padded_N, -1)
+        w_global_scale_inv = torch.reciprocal(w_global_scale)
+        xq, x_scale, x_token_scale_inv = nvfp4_quantize_stacked_with_token_scale(
+            m_sizes, X
+        )
+
+        out_wrapped = f4f4bf16_ultra_grouped_mm_autograd(
+            xq,
+            wq.transpose(-2, -1),
+            x_scale,
+            w_scale,
+            offsets,
+            x_token_scale_inv,
+            w_global_scale_inv,
+        )
+        out_raw = torch.ops.mslk.f4f4bf16_ultra_grouped_mm(
+            xq,
+            wq.transpose(-2, -1),
+            x_scale,
+            w_scale,
+            offsets,
+            x_token_scale_inv,
+            w_global_scale_inv,
+        )
+        torch.testing.assert_close(out_wrapped, out_raw)
 
 
 if __name__ == "__main__":

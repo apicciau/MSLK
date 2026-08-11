@@ -14,7 +14,7 @@ import torch
 import torch.nn.functional as F
 
 import mslk.gemm  # noqa: F401 — triggers op registration
-from mslk.utils.flydsl import is_flydsl_available
+from mslk.flydsl.common import is_flydsl_available
 
 
 def _run_torch_blockscale_ref(
