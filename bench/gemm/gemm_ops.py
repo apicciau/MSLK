@@ -1901,6 +1901,37 @@ class TritonBF16Int4Rowwise(CutlassBF16Int4Rowwise):
 
 
 @register_gemm_op
+class TritonBF16Int4RowwiseBatched(TritonBF16Int4Rowwise):
+    """ROCm Triton BF16xINT4 rowwise batched GEMM."""
+
+    def preprocess(self, x, w):
+        assert isinstance(x, list) and isinstance(w, list)
+        wq_list, scale_list, zp_list = [], [], []
+        for w_i in w:
+            wq_i, scale_i, zp_i = int4_row_quantize_zp(w_i)
+            wq_list.append(pack_int4(wq_i))
+            scale_list.append(scale_i)
+            zp_list.append(zp_i)
+        x = torch.stack(x, dim=0).to(torch.bfloat16)
+        wq = torch.stack(wq_list, dim=0)
+        w_scale = torch.cat(scale_list, dim=0)
+        w_zp = torch.cat(zp_list, dim=0)
+        return x, wq, w_scale, w_zp
+
+    def quantize(self, x, wq, w_scale, w_zp):
+        return x, wq, w_scale, w_zp
+
+    def compute(self, x, wq, w_scale, w_zp):
+        from mslk.gemm.triton.int4_gemm import matmul_bf16i4_rowwise_batched
+
+        return matmul_bf16i4_rowwise_batched(x, wq, w_scale, w_zp)
+
+    @property
+    def supported_gemm_types(self) -> set[GemmType]:
+        return {GemmType.GROUPED}
+
+
+@register_gemm_op
 class TritonBF16Int4Shuffled(TritonBF16Int4Rowwise):
     """ROCm Triton BF16xINT4 shuffled GEMM (routes to rowwise on AMD)."""
 
