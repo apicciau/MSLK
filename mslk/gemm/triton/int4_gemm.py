@@ -253,10 +253,11 @@ def _bf16i4_rowwise_kernel(
             X_odd_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
         )
         w_q = tl.load(
-            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
+            W_ptr + offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
         ).to(tl.int32)
     elif EVEN_MN:
         k_mask = offs_k2[None, :] < K2
+        w_k_mask = offs_k2[:, None] < K2
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=k_mask,
@@ -268,13 +269,13 @@ def _bf16i4_rowwise_kernel(
             other=0.0,
         )
         w_q = tl.load(
-            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
-            mask=k_mask,
+            W_ptr + offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+            mask=w_k_mask,
             other=0,
         ).to(tl.int32)
     elif EVEN_K:
         xk_mask = offs_m[:, None] < M
-        wk_mask = offs_n[:, None] < N
+        wk_mask = offs_n[None, :] < N
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
@@ -286,13 +287,13 @@ def _bf16i4_rowwise_kernel(
             other=0.0,
         )
         w_q = tl.load(
-            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
+            W_ptr + offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
             mask=wk_mask,
             other=0,
         ).to(tl.int32)
     else:
         xk_mask = (offs_m[:, None] < M) & (offs_k2[None, :] < K2)
-        wk_mask = (offs_n[:, None] < N) & (offs_k2[None, :] < K2)
+        wk_mask = (offs_k2[:, None] < K2) & (offs_n[None, :] < N)
         x_even = tl.load(
             X_even_ptr + offs_m[:, None] * stride_xm + offs_k2[None, :] * stride_xk,
             mask=xk_mask,
@@ -304,7 +305,7 @@ def _bf16i4_rowwise_kernel(
             other=0.0,
         )
         w_q = tl.load(
-            W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk,
+            W_ptr + offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
             mask=wk_mask,
             other=0,
         ).to(tl.int32)
@@ -335,12 +336,13 @@ def _bf16i4_rowwise_kernel(
         k2_start = k2_slice_start + k2_idx * BLOCK_K
 
         # Unpack and dequant current tile (uses already-loaded data)
+        # w_q is [BLOCK_K, BLOCK_N] from the transposed load; s, z are [BLOCK_N].
         w_lo = w_q & 0x0F
         w_hi = (w_q >> 4) & 0x0F
-        s_col = s[:, None]
-        z_col = z[:, None]
-        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s_col + z_col
-        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s_col + z_col
+        s_row = s[None, :]
+        z_row = z[None, :]
+        w_lo_dq = ((w_lo ^ 8) - 8).to(tl.float32) * s_row + z_row
+        w_hi_dq = ((w_hi ^ 8) - 8).to(tl.float32) * s_row + z_row
 
         # Prefetch next iteration (clamp to last valid tile on final iteration)
         next_k2_start = tl.minimum(k2_start + BLOCK_K, k2_slice_end - BLOCK_K)
@@ -357,10 +359,11 @@ def _bf16i4_rowwise_kernel(
                 + next_offs_k2[None, :] * stride_xk,
             )
             next_w_q = tl.load(
-                W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
+                W_ptr + next_offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
             ).to(tl.int32)
         elif EVEN_MN:
             next_k_mask = next_offs_k2[None, :] < K2
+            next_w_k_mask = next_offs_k2[:, None] < K2
             next_x_even = tl.load(
                 X_even_ptr
                 + offs_m[:, None] * stride_xm
@@ -376,13 +379,13 @@ def _bf16i4_rowwise_kernel(
                 other=0.0,
             )
             next_w_q = tl.load(
-                W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
-                mask=next_k_mask,
+                W_ptr + next_offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
+                mask=next_w_k_mask,
                 other=0,
             ).to(tl.int32)
         elif EVEN_K:
             next_xk_mask = offs_m[:, None] < M
-            next_wk_mask = offs_n[:, None] < N
+            next_wk_mask = offs_n[None, :] < N
             next_x_even = tl.load(
                 X_even_ptr
                 + offs_m[:, None] * stride_xm
@@ -398,13 +401,13 @@ def _bf16i4_rowwise_kernel(
                 other=0.0,
             )
             next_w_q = tl.load(
-                W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
+                W_ptr + next_offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
                 mask=next_wk_mask,
                 other=0,
             ).to(tl.int32)
         else:
             next_xk_mask = (offs_m[:, None] < M) & (next_offs_k2[None, :] < K2)
-            next_wk_mask = (offs_n[:, None] < N) & (next_offs_k2[None, :] < K2)
+            next_wk_mask = (next_offs_k2[:, None] < K2) & (offs_n[None, :] < N)
             next_x_even = tl.load(
                 X_even_ptr
                 + offs_m[:, None] * stride_xm
@@ -420,7 +423,7 @@ def _bf16i4_rowwise_kernel(
                 other=0.0,
             )
             next_w_q = tl.load(
-                W_ptr + offs_n[:, None] * stride_wn + next_offs_k2[None, :] * stride_wk,
+                W_ptr + next_offs_k2[:, None] * stride_wk + offs_n[None, :] * stride_wn,
                 mask=next_wk_mask,
                 other=0,
             ).to(tl.int32)
@@ -445,36 +448,34 @@ def _bf16i4_rowwise_kernel(
         if HAS_X_SCALE:
             acc = tl.dot(
                 x_even,
-                tl.trans(w_lo_dq.to(tl.bfloat16)),
+                w_lo_dq.to(tl.bfloat16),
                 acc,
                 out_dtype=tl.float32,
             )
             acc = tl.dot(
                 x_odd,
-                tl.trans(w_hi_dq.to(tl.bfloat16)),
+                w_hi_dq.to(tl.bfloat16),
                 acc,
                 out_dtype=tl.float32,
             )
         elif FUSE_DOT:
-            # `dim` exists only on newer triton (guarded by FUSE_DOT/_TL_CAT_HAS_DIM);
-            # the pinned stable stub lacks it, so Pyre flags the keyword.
             x_fused = tl.cat(x_even, x_odd, dim=1)  # pyre-ignore[28]
             w_fused = tl.cat(
                 w_lo_dq.to(tl.bfloat16),
                 w_hi_dq.to(tl.bfloat16),
-                dim=1,  # pyre-ignore[28]
+                dim=0,  # pyre-ignore[28]
             )
-            acc = tl.dot(x_fused, tl.trans(w_fused), acc, out_dtype=tl.float32)
+            acc = tl.dot(x_fused, w_fused, acc, out_dtype=tl.float32)
         else:
             acc = tl.dot(
                 x_even,
-                tl.trans(w_lo_dq.to(tl.bfloat16)),
+                w_lo_dq.to(tl.bfloat16),
                 acc,
                 out_dtype=tl.float32,
             )
             acc = tl.dot(
                 x_odd,
-                tl.trans(w_hi_dq.to(tl.bfloat16)),
+                w_hi_dq.to(tl.bfloat16),
                 acc,
                 out_dtype=tl.float32,
             )
@@ -632,7 +633,7 @@ def matmul_bf16i4_rowwise(
         1,
         w_scale_group.stride(0),
         w_scale_group.stride(1),
-        FUSE_DOT=_TL_CAT_HAS_DIM,
+        FUSE_DOT=_TL_CAT_HAS_DIM and M > 32,
         HAS_X_SCALE=False,
     )
 
