@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_fwd_splitkv_setting.h"
 #include "ck_tiled_fmha_num_kv_split_switch.h"
@@ -262,6 +264,7 @@ struct batched_forward_splitkv_mask_bias_dropout_dispatch {
             (param.window_size > 0) ? param.window_size - 1
                                     : -1, // window_left_size
             (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+            0, // sink_size
             param.custom_mask_type);
       else
         return FmhaFwdSplitKVKernel::MakeKargs(
@@ -311,17 +314,20 @@ struct batched_forward_splitkv_mask_bias_dropout_dispatch {
             (param.window_size > 0) ? param.window_size - 1
                                     : -1, // window_left_size
             (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+            0, // sink_size
             param.custom_mask_type);
     }();
 
     dim3 kGridSize = FmhaFwdSplitKVKernel::GridSize(
         param.B, param.Hq, param.Hkv, param.M, param.Kv, param.num_kv_splits);
-    constexpr dim3 kBlockSize = FmhaFwdSplitKVKernel::BlockSize();
+    const dim3 kBlockSize = FmhaFwdSplitKVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaFwdSplitKVKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-009");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaFwdSplitKVKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 
@@ -356,13 +362,15 @@ struct batched_forward_splitkv_mask_bias_dropout_dispatch {
 
     dim3 kGridSize = FmhaSplitKVCombineKernel::GridSize(
         param.B, param.Hq, param.M, param.Kv);
-    constexpr dim3 kBlockSize = FmhaSplitKVCombineKernel::BlockSize();
+    const dim3 kBlockSize = FmhaSplitKVCombineKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaSplitKVCombineKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-013");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaSplitKVCombineKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 };

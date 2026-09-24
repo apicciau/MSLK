@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_bwd_setting.h"
 #include "ck_tiled_fmha_params.h"
@@ -49,6 +51,7 @@ struct batched_backward_mask_bias_dropout_dispatch {
       false, // kIsDeterministic
       FmhaMask,
       FmhaBlockDropout,
+      false, // kUseTrLoad
       FmhaTraits>;
 
   static constexpr bool NeedConvertGradQ = !std::is_same<
@@ -111,28 +114,18 @@ struct batched_backward_mask_bias_dropout_dispatch {
 
       BOOL_SWITCH_2(
           pad_headdim_q, kPadHeadDimQ, pad_headdim_v, kPadHeadDimV, [&] {
-            using FmhaBwdTraits_ = ck_tile::TileFmhaTraits<
-                kPadSeqLenQ,
-                kPadSeqLenK,
+            using FmhaBwdTraits_ = ck_tile::TileFmhaBwdTraits<
                 kPadHeadDimQ,
                 kPadHeadDimV,
-                false, // kHasLogitsSoftCap
                 kBiasEnum,
                 kHasBiasGrad,
-                false, // kStoreLSE
-                false, // place-holder for kHasDropout, not used actually
-                false, // kDoFp8StaticQuant place-holder
                 occupancy>;
 
             using FmhaBwdPipelineProblem =
                 FmhaBwdPipelineProblemTemp<FmhaBwdTraits_, FmhaMask>;
 
-            constexpr auto FmhaBwdPipelineEnum_ =
-                FmhaBwdPipelineEnumSelector<MaxK>::value;
-
-            using FmhaBwdPipeline_ = typename FmhaBwdPipelineMaker<
-                FmhaBwdPipelineEnum_,
-                FmhaBwdPipelineProblem>::pipeline;
+            using FmhaBwdPipeline_ =
+                ck_tile::BlockFmhaBwdDQDKDVPipeline<FmhaBwdPipelineProblem>;
 
             using FmhaBwdKGradEpilogue_ =
                 ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
@@ -221,13 +214,15 @@ struct batched_backward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize =
         FmhaBwdOGradDotOKernel::GridSize(param.B, param.Hq, param.M);
-    constexpr dim3 kBlockSize = FmhaBwdOGradDotOKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdOGradDotOKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdOGradDotOKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-004");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdOGradDotOKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 
@@ -236,7 +231,7 @@ struct batched_backward_mask_bias_dropout_dispatch {
       BatchedBackwardParams& param,
       hipStream_t stream) {
     const auto kargs = [&] {
-      return FmhaBwdDQDKDVKernel::MakeKargs(
+      return FmhaBwdDQDKDVKernel::MakeKargsImpl(
           param.q_ptr,
           param.k_ptr,
           param.v_ptr,
@@ -304,12 +299,14 @@ struct batched_backward_mask_bias_dropout_dispatch {
     }();
 
     dim3 kGridSize = FmhaBwdDQDKDVKernel::GridSize(param.B, param.Hq, param.N);
-    constexpr dim3 kBlockSize = FmhaBwdDQDKDVKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdDQDKDVKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaBwdDQDKDVKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-005");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdDQDKDVKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 
@@ -335,13 +332,15 @@ struct batched_backward_mask_bias_dropout_dispatch {
 
     dim3 kGridSize =
         FmhaBwdConvertQGradKernel::GridSize(param.B, param.Hq, param.M);
-    constexpr dim3 kBlockSize = FmhaBwdConvertQGradKernel::BlockSize();
+    const dim3 kBlockSize = FmhaBwdConvertQGradKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu =
         FmhaBwdConvertQGradKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-006");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaBwdConvertQGradKernel{}, kGridSize, kBlockSize, 0, kargs));
   }
 };

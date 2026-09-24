@@ -14,7 +14,7 @@ import triton  # @manual
 import triton.language as tl  # @manual
 from mslk.gemm.triton.matmul_perf_model import early_config_prune, estimate_matmul_time
 from mslk.gemm.triton.utils import map_dtype_to_triton, TmaAutoTuneHelper
-from mslk.utils.device import supports_float8_fnuz
+from mslk.utils.device import is_hopper, supports_float8_fnuz
 from mslk.utils.triton.fp8_utils import get_fp8_constants, reinterpret_fp8_type
 from packaging import version
 from torch._tensor import Tensor
@@ -86,13 +86,199 @@ def get_configs_io_bound() -> List[Config]:
     return configs
 
 
-def dummy_prune_configs(configs, named_args, **kwargs):
+# Hopper WGMMA shape minimums.
+WGMMA_M_MINIMUM = 64
+WGMMA_N_MINIMUM = 8
+WGMMA_K_MINIMUM = 32
+
+
+def prune_configs_wgmma_compute_bound(configs, M, N, K):
+    """Keep configs within the WGMMA compute-bound tile caps.
+
+    MAX_BLOCK_M/N/K = max(next_pow2(dim), WGMMA_*_MINIMUM,
+    MINIMUM_BLOCK_*): drops tiles doing more than ~2x masked work on
+    any axis while still meeting WGMMA shape minimums.
+    """
+    max_bm = max(triton.next_power_of_2(M), WGMMA_M_MINIMUM, MINIMUM_BLOCK_M)
+    max_bn = max(triton.next_power_of_2(N), WGMMA_N_MINIMUM, MINIMUM_BLOCK_N)
+    max_bk = max(triton.next_power_of_2(K), WGMMA_K_MINIMUM, MINIMUM_BLOCK_K)
+    return [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_M"] <= max_bm
+        and c.kwargs["BLOCK_N"] <= max_bn
+        and c.kwargs["BLOCK_K"] <= max_bk
+    ]
+
+
+_H100_SMEM_BYTES = 228 * 1024
+
+_IO_SWEEP_BLOCK_M = (16, 32)
+
+
+def prune_configs_smem_stages(configs, M, N, K):
+    """Keep configs whose pipeline fits SMEM and can saturate.
+
+    SMEM fit (all configs): `num_stages * BLOCK_K * (BLOCK_M + BLOCK_N)`
+    FP8 bytes must fit one CTA in 228KB. Feasibility guard — every current
+    config passes; it bites only on future larger tiles/stages.
+    Saturation (IO sweep only): `num_stages <= k_tiles + 1` with
+    `k_tiles = cdiv(K, BLOCK_K)` (the +1 is the epilogue-overlapped drain
+    iteration); single-iteration pipelines keep all stages. Restricted to
+    `BLOCK_M in (16, 32)` so compute tiles (fixed stages, no sisters) are
+    never removed. K is exact (`k_key = K`; only `m_key` buckets), so no
+    bucket adjustment is needed.
+    """
+    kept = []
+    for c in configs:
+        kw = c.kwargs
+        bm = kw["BLOCK_M"]
+        bn = kw["BLOCK_N"]
+        bk = kw["BLOCK_K"]
+        if c.num_stages * bk * (bm + bn) > _H100_SMEM_BYTES:
+            continue
+        if bm in _IO_SWEEP_BLOCK_M:
+            k_tiles = triton.cdiv(K, bk)
+            if k_tiles > 1 and c.num_stages > k_tiles + 1:
+                continue
+        kept.append(c)
+    return kept
+
+
+# K edges determined experimentally, not derived: ground-truth
+# microbenchmarks (CUDA graphs, L2-flushed, median of 50 replays) show
+# BK=64's last refuge config falls out of the top 3 between K=6144 and
+# K=6400 (fitted per-tile-overhead crossover ~6278). 6656 is the first
+# suite K above that measured transition; 1024 is the analogous edge
+# where BK=32 stops contending.
+_BK_FLOOR_K_MEDIUM = 1024
+_BK_FLOOR_K_LARGE = 6656
+_BK_FLOOR_MEDIUM = 64
+_BK_FLOOR_LARGE = 128
+
+
+def prune_configs_bk_floor(configs, M, N, K):
+    """Keep configs whose BLOCK_K meets the K-driven floor.
+
+    MIN_BLOCK_K = 32 for K < 1024, 64 for K < 6656, else 128: below the
+    floor the K loop runs so many underfilled TMA tiles that the config
+    never contends (41-shape ground truth: BK=32 never better than #6
+    at K >= 1024, BK=64 never better than #4 at K >= 6656; all 41
+    winners kept). NCU shows doubling BK costs SMEM but not registers
+    (60/60 and 108/126 regs/thread pairs), so the larger floor tile is
+    close to free.
+    """
+    if K >= _BK_FLOOR_K_LARGE:
+        min_bk = _BK_FLOOR_LARGE
+    elif K >= _BK_FLOOR_K_MEDIUM:
+        min_bk = _BK_FLOOR_MEDIUM
+    else:
+        min_bk = MINIMUM_BLOCK_K
+    return [c for c in configs if c.kwargs["BLOCK_K"] >= min_bk]
+
+
+_BMN_FLOOR_M = 512
+_BMN_FLOOR_K = 1024
+_BMN_FLOOR_N = 1024
+_BMN_FLOOR_N_LARGE = 8192
+_BMN_FLOOR_K_LARGE = 2048
+_BM_FLOOR = 64
+_BN_FLOOR = 64
+_BN_FLOOR_LARGE = 128
+_PRODUCT_BAND_MIN_M = 64
+_BM_PRODUCT_MN = 8388608
+_BN_PRODUCT_MN = 393216
+
+
+def prune_configs_bmn_floor(configs, M, N, K):
+    bm_product = M >= _PRODUCT_BAND_MIN_M and M * N >= _BM_PRODUCT_MN
+    bn_product = (
+        M >= _PRODUCT_BAND_MIN_M and M * N >= _BN_PRODUCT_MN and K >= _BMN_FLOOR_K
+    )
+    min_bm = (
+        _BM_FLOOR
+        if ((M >= _BMN_FLOOR_M and K >= _BMN_FLOOR_K) or bm_product)
+        else MINIMUM_BLOCK_M
+    )
+    if N >= _BMN_FLOOR_N_LARGE and K >= _BMN_FLOOR_K_LARGE:
+        min_bn = _BN_FLOOR_LARGE
+    elif (N >= _BMN_FLOOR_N and M >= _BMN_FLOOR_M and K >= _BMN_FLOOR_K) or bn_product:
+        min_bn = _BN_FLOOR
+    else:
+        min_bn = WGMMA_N_MINIMUM
+    return [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_M"] >= min_bm and c.kwargs["BLOCK_N"] >= min_bn
+    ]
+
+
+_H100_REGS_PER_THREAD = 255
+_THREADS_PER_WARP = 32
+
+
+def prune_configs_register_cap(configs, M, N, K):
+    return [
+        c
+        for c in configs
+        if c.kwargs["BLOCK_M"] * c.kwargs["BLOCK_N"]
+        <= _H100_REGS_PER_THREAD * c.num_warps * _THREADS_PER_WARP
+    ]
+
+
+_NS_FLOOR_DROPPED = 2
+_NS_FLOOR_SISTER = 3
+
+
+def prune_configs_ns_floor(configs, M, N, K):
+    kept = []
+    for c in configs:
+        kw = c.kwargs
+        if c.num_stages == _NS_FLOOR_DROPPED and (
+            _NS_FLOOR_SISTER * kw["BLOCK_K"] * (kw["BLOCK_M"] + kw["BLOCK_N"])
+            <= _H100_SMEM_BYTES
+        ):
+            continue
+        kept.append(c)
+    return kept
+
+
+def prune_configs_h100_static(configs, named_args, **kwargs):
+    """Static H100 prune for the persistent non-TMA FP8 rowwise kernel.
+
+    Delegates to prune_configs_wgmma_compute_bound,
+    prune_configs_smem_stages, prune_configs_bk_floor,
+    prune_configs_bmn_floor, prune_configs_register_cap, and
+    prune_configs_ns_floor.
+    Hopper-only (see is_hopper); any other device falls through
+    unpruned, as does the all-dropped safety net (full-space fallback).
+    """
     M = named_args["M"]
     N = named_args["N"]
     K = named_args["K"]
 
-    logger.info(f"{len(configs)=} {len(configs)=} for {M=} {N=} {K=}")
-    return configs
+    if not is_hopper():
+        return configs
+
+    n_in = len(configs)
+    kept = prune_configs_wgmma_compute_bound(configs, M, N, K)
+    kept = prune_configs_smem_stages(kept, M, N, K)
+    kept = prune_configs_bk_floor(kept, M, N, K)
+    kept = prune_configs_bmn_floor(kept, M, N, K)
+    kept = prune_configs_register_cap(kept, M, N, K)
+    kept = prune_configs_ns_floor(kept, M, N, K)
+
+    if not kept:
+        logger.warning(
+            f"[h100-static-prune] all {n_in} configs pruned for "
+            f"M={M} N={N} K={K}; falling back to full space"
+        )
+        return configs
+    logger.info(
+        f"[h100-static-prune] {n_in=} {len(kept)=} pruned={n_in - len(kept)} "
+        f"for M={M} N={N} K={K}"
+    )
+    return kept
 
 
 MATMUL_CONFIGS: List[Config] = [
@@ -200,11 +386,15 @@ MATMUL_CONFIGS: List[Config] = [
     ),
 ] + get_configs_io_bound()
 
+MINIMUM_BLOCK_M = min(c.kwargs["BLOCK_M"] for c in MATMUL_CONFIGS)
+MINIMUM_BLOCK_N = min(c.kwargs["BLOCK_N"] for c in MATMUL_CONFIGS)
+MINIMUM_BLOCK_K = min(c.kwargs["BLOCK_K"] for c in MATMUL_CONFIGS)
+
 
 @triton.autotune(
     configs=MATMUL_CONFIGS,
     prune_configs_by={
-        "early_config_prune": dummy_prune_configs,
+        "early_config_prune": prune_configs_h100_static,
     },
     key=[
         "m_key",

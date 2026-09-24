@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_fwd_setting.h"
 #include "ck_tiled_fmha_params.h"
@@ -46,6 +48,7 @@ struct grouped_forward_mask_bias_dropout_dispatch {
       true, // kIsGroupMode
       AttentionVariant<FmhaTraits>,
       FmhaMask,
+      false, // kUseTrLoad
       FmhaTraits>;
 
   static void Run(GroupedForwardParams& param, hipStream_t stream) {
@@ -79,7 +82,7 @@ struct grouped_forward_mask_bias_dropout_dispatch {
               false, // kHasBiasGrad place-holder
               true, // kStoreLSE
               kHasDropout,
-              false, // kDoFp8StaticQuant place-holder
+              ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,
               occupancy>;
 
           using FmhaPipelineProblem =
@@ -88,7 +91,7 @@ struct grouped_forward_mask_bias_dropout_dispatch {
           using FmhaFwdPipeline_ = std::conditional_t<
               MaxK <= 256,
               ck_tile::BlockFmhaPipelineQRKSVS<FmhaPipelineProblem>,
-              ck_tile::BlockFmhaPipelineQSKSVS<FmhaPipelineProblem>>;
+              MslkBlockFmhaPipelineQSKSVS<FmhaPipelineProblem>>;
 
           using FmhaFwdEpilogue_ =
               ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<
@@ -112,19 +115,21 @@ struct grouped_forward_mask_bias_dropout_dispatch {
           param.k_ptr,
           param.v_ptr,
           param.attn_bias_ptr,
+          nullptr, // q_descale_ptr
+          nullptr, // k_descale_ptr
+          nullptr, // v_descale_ptr
           nullptr, // rand_val_ptr
           param.logsumexp_ptr,
           param.out_ptr,
           param.seqstart_q_dev_ptr,
           param.seqstart_k_dev_ptr,
+          nullptr, // seqlen_q_ptr
           param.seqlen_k_dev_ptr,
           param.K, // hdim_q
           param.Kv, // hdim_v
           param.Hq, // nhead_q
           param.Hq / param.Hkv, // nhead_ratio_qk
           param.scale,
-          1.0f, // scale_p
-          1.0f, // scale_o
           0.0f, // logits_soft_cap
           param.q_strides[0], // q, k, v, bias, randval, out tensor seq-dim
                               // stride
@@ -144,6 +149,7 @@ struct grouped_forward_mask_bias_dropout_dispatch {
           (param.window_size > 0) ? param.window_size - 1
                                   : -1, // window_left_size
           (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+          0, // sink_size
           param.custom_mask_type,
           0, // min_seqlen_q, most recently added kernel argument
           param.dropout_prob,
@@ -157,12 +163,14 @@ struct grouped_forward_mask_bias_dropout_dispatch {
         param.max_seqlen_q,
         param.Kv,
         param.seqlen_k_dev_ptr != nullptr);
-    constexpr dim3 kBlockSize = FmhaFwdKernel::BlockSize();
+    const dim3 kBlockSize = FmhaFwdKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaFwdKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-020");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaFwdKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 };

@@ -12,6 +12,8 @@
 #include <ck_tile/ops/epilogue.hpp>
 #include <ck_tile/ops/fmha.hpp>
 
+#include <mslk/utils/device/launch_checks.h>
+
 #include "ck_tiled_bool_switch.h"
 #include "ck_tiled_fmha_fwd_setting.h"
 #include "ck_tiled_fmha_params.h"
@@ -56,6 +58,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
       false, // kIsGroupMode
       AttentionVariant<FmhaTraits>,
       FmhaMask,
+      false, // kUseTrLoad
       FmhaTraits>;
 
   static void Run(BatchedForwardParams& param, hipStream_t stream) {
@@ -99,7 +102,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
                 false, // kHasBiasGrad place-holder
                 false, // kStoreLSE
                 kHasDropout,
-                false, // kDoFp8StaticQuant place-holder
+                ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,
                 occupancy>;
 
             using FmhaPipelineProblem =
@@ -114,7 +117,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
 
             if constexpr (kUseWholeKPrefetchPipeline) {
               using FmhaPipeline =
-                  ck_tile::BlockFmhaPipelineQRKSVSWholeKPrefetch<
+                  MslkBlockFmhaPipelineQRKSVSWholeKPrefetch<
                       FmhaPipelineProblem>;
               using FmhaKernel =
                   ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
@@ -129,7 +132,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
               RunWithKernel<FmhaKernel>(param, stream);
             } else {
               using FmhaPipeline =
-                  ck_tile::BlockFmhaPipelineQSKSVS<FmhaPipelineProblem>;
+                  MslkBlockFmhaPipelineQSKSVS<FmhaPipelineProblem>;
               using FmhaKernel =
                   ck_tile::FmhaFwdKernel<FmhaPipeline, FmhaEpilogue>;
 
@@ -149,7 +152,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
               false, // kHasBiasGrad place-holder
               false, // kStoreLSE
               kHasDropout,
-              false, // kDoFp8StaticQuant place-holder
+              ck_tile::BlockAttentionQuantScaleEnum::NO_SCALE,
               occupancy>;
 
           using FmhaPipelineProblem =
@@ -183,6 +186,9 @@ struct batched_infer_mask_bias_dropout_dispatch {
           param.k_ptr,
           param.v_ptr,
           param.attn_bias_ptr,
+          nullptr, // q_descale_ptr
+          nullptr, // k_descale_ptr
+          nullptr, // v_descale_ptr
           nullptr, // rand_val_ptr
           nullptr, // lse_ptr
           param.out_ptr,
@@ -193,8 +199,6 @@ struct batched_infer_mask_bias_dropout_dispatch {
           param.Hq, // nhead_q
           param.Hq / param.Hkv, // nhead_ratio_qk
           param.scale,
-          1.0f, // scale_p
-          1.0f, // scale_o
           0.0f, // logits_soft_cap
           param.q_strides[1], // q, k, v, bias, randval, out tensor seq-dim
                               // stride
@@ -222,6 +226,7 @@ struct batched_infer_mask_bias_dropout_dispatch {
           (param.window_size > 0) ? param.window_size - 1
                                   : -1, // window_left_size
           (param.custom_mask_type == 0) ? -1 : 0, // window_right_size
+          0, // sink_size
           param.custom_mask_type,
           param.dropout_prob, // dropout ratio
           false, // is_store_randval
@@ -230,12 +235,14 @@ struct batched_infer_mask_bias_dropout_dispatch {
 
     dim3 kGridSize =
         FmhaKernel::GridSize(param.B, param.Hq, param.M, param.Kv, false);
-    constexpr dim3 kBlockSize = FmhaKernel::BlockSize();
+    const dim3 kBlockSize = FmhaKernel::BlockSize();
     constexpr ck_tile::index_t kBlockPerCu = FmhaKernel::kBlockPerCu;
 
+    mslk::utils::device::check_launch_thread_product(
+        kGridSize, kBlockSize, "MSLK-008");
     (void)ck_tile::launch_kernel(
         ck_tile::stream_config{stream, false},
-        ck_tile::make_kernel<kBlockSize.x, kBlockPerCu>(
+        ck_tile::make_kernel<kBlockPerCu>(
             FmhaKernel{}, kGridSize, kBlockSize, 0, kargs));
   };
 };
