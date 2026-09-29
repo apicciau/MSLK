@@ -45,6 +45,10 @@ from triton import Config  # @manual
 
 _TL_CAT_HAS_DIM = "dim" in inspect.signature(tl.cat).parameters
 
+# Cache for pre-transposed weight tensors.  Keyed by data_ptr() so the
+# HIP memcpy happens once per unique weight tensor, not per forward pass.
+_W_TRANSPOSE_CACHE: Dict[int, torch.Tensor] = {}
+
 # ---------------------------------------------------------------------------
 # Autotuning configs
 # ---------------------------------------------------------------------------
@@ -335,8 +339,8 @@ def _bf16i4_rowwise_kernel(
     for k2_idx in tl.range(0, num_iters):
         k2_start = k2_slice_start + k2_idx * BLOCK_K
 
-        # Unpack and dequant current tile (uses already-loaded data)
-        # w_q is [BLOCK_K, BLOCK_N] from the transposed load; s, z are [BLOCK_N].
+        # Unpack and dequant current tile (uses already-loaded data).
+        # w_q is [BLOCK_K, BLOCK_N] from the pre-transposed weight load.
         w_lo = w_q & 0x0F
         w_hi = (w_q >> 4) & 0x0F
         s_row = s[None, :]
@@ -600,6 +604,13 @@ def matmul_bf16i4_rowwise(
     x_even = X_2d[:, 0::2].contiguous()  # [M, K//2]
     x_odd = X_2d[:, 1::2].contiguous()  # [M, K//2]
 
+    # Pre-transpose W from [N, K//2] to [K//2, N] so the kernel loads tiles as
+    # [BLOCK_K, BLOCK_N] directly — coalesced along N — without needing tl.trans.
+    w_key = W.data_ptr()
+    if w_key not in _W_TRANSPOSE_CACHE:
+        _W_TRANSPOSE_CACHE[w_key] = W.T.contiguous()
+    W_T = _W_TRANSPOSE_CACHE[w_key]
+
     def grid(meta):
         return (
             triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),
@@ -615,7 +626,7 @@ def matmul_bf16i4_rowwise(
     _bf16i4_rowwise_kernel[grid](
         x_even,
         x_odd,
-        W,
+        W_T,
         workspace,
         w_scale_group,
         w_zero_group,
@@ -626,14 +637,14 @@ def matmul_bf16i4_rowwise(
         group_size,
         x_even.stride(0),
         x_even.stride(1),
-        W.stride(0),
-        W.stride(1),
+        W_T.stride(1),
+        W_T.stride(0),
         M * N,
         N,
         1,
         w_scale_group.stride(0),
         w_scale_group.stride(1),
-        FUSE_DOT=_TL_CAT_HAS_DIM and M > 32,
+        FUSE_DOT=_TL_CAT_HAS_DIM,
         HAS_X_SCALE=False,
     )
 
