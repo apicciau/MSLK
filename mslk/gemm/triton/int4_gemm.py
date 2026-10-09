@@ -36,6 +36,7 @@ Activation pre-split strategy (avoids LDS bank conflicts):
 """
 
 import inspect
+import os
 from typing import Any, Dict, List
 
 import torch
@@ -44,6 +45,10 @@ import triton.language as tl  # @manual
 from triton import Config  # @manual
 
 _TL_CAT_HAS_DIM = "dim" in inspect.signature(tl.cat).parameters
+
+# Experiment toggle: MSLK_BF16I4_GEMV=0 sends M == 1 through the tiled kernel
+# instead of the GEMV kernel, for A/B benchmarking within a single build.
+_GEMV_ENABLED = os.environ.get("MSLK_BF16I4_GEMV", "1") != "0"
 
 # Cache for pre-transposed weight tensors.  Keyed by data_ptr() so the
 # HIP memcpy happens once per unique weight tensor, not per forward pass.
@@ -523,6 +528,122 @@ def _bf16i4_rowwise_kernel(
 
 
 # ---------------------------------------------------------------------------
+# GEMV kernel (M == 1) — tl.sum instead of tl.dot, no BLOCK_M padding
+# ---------------------------------------------------------------------------
+
+
+_MAX_GEMV_SPLIT_K = 32  # largest SPLIT_K value in the GEMV config sweep
+
+
+def _get_gemv_configs() -> List[Config]:
+    configs = []
+    for bn in [32, 64, 128]:
+        for bk in [32, 64, 128]:
+            for sk in [4, 8, 16, 32]:
+                for waves in [0, 2, 4]:
+                    configs.append(
+                        Config(
+                            {
+                                "BLOCK_N": bn,
+                                "BLOCK_K": bk,
+                                "SPLIT_K": sk,
+                                "waves_per_eu": waves,
+                            },
+                            num_warps=4,
+                            num_stages=2,
+                        )
+                    )
+    return configs
+
+
+def _prune_gemv_configs(
+    configs: List[Config], named_args: Dict[str, Any], **kwargs
+) -> List[Config]:
+    # Scale-after-dot applies one (scale, zero) pair per K-tile, so the tile's
+    # 2 * BLOCK_K unpacked K-elements must lie inside a single quantisation group.
+    group_size = named_args["group_size"]
+    return [c for c in configs if group_size % (2 * c.kwargs["BLOCK_K"]) == 0]
+
+
+@triton.autotune(
+    configs=_get_gemv_configs(),
+    key=["N", "K2", "group_size"],
+    prune_configs_by={"early_config_prune": _prune_gemv_configs},
+)
+@triton.jit
+def _bf16i4_gemv_kernel(
+    X_even_ptr,  # [K//2]  bfloat16
+    X_odd_ptr,  # [K//2]  bfloat16
+    W_ptr,  # [N, K//2]  int8 packed (original layout, not pre-transposed)
+    workspace_ptr,  # [SPLIT_K, N]  float32
+    scale_ptr,  # [num_groups, N]
+    zero_ptr,  # [num_groups, N]
+    N,
+    K2,
+    group_size,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_sg,
+    stride_sn,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+) -> None:
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)  # index of this program's contiguous K2 slice
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = offs_n < N
+    last_group_idx = K2 * 2 // group_size - 1
+
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    steps_per_slice = tl.cdiv(K2, SPLIT_K * BLOCK_K)
+    slice_start = pid_k * steps_per_slice * BLOCK_K
+    for step in tl.range(0, steps_per_slice):
+        k2_start = slice_start + step * BLOCK_K
+        offs_k2 = k2_start + tl.arange(0, BLOCK_K)
+        k_mask = offs_k2 < K2
+
+        x_even = tl.load(
+            X_even_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
+        ).to(tl.float32)
+        x_odd = tl.load(
+            X_odd_ptr + offs_k2 * stride_xk, mask=k_mask, other=0.0
+        ).to(tl.float32)
+
+        w_ptrs = W_ptr + offs_n[:, None] * stride_wn + offs_k2[None, :] * stride_wk
+        w_mask = n_mask[:, None] & k_mask[None, :]
+        w_q = tl.load(w_ptrs, mask=w_mask, other=0).to(tl.int32)  # [BLOCK_N, BLOCK_K]
+
+        q_lo = ((w_q & 0x0F) ^ 8) - 8
+        q_hi = (((w_q >> 4) & 0x0F) ^ 8) - 8
+
+        # Integer-weight dot per output column; scale and zero are applied once
+        # per tile below rather than per element.
+        lo_dot = tl.sum(q_lo.to(tl.float32) * x_even[None, :], axis=1)  # [BLOCK_N]
+        hi_dot = tl.sum(q_hi.to(tl.float32) * x_odd[None, :], axis=1)
+
+        # A tile entirely past K2 loaded only zeros, so clamping its group index
+        # to the last valid group keeps the scale load in bounds without
+        # changing the result.
+        group_idx = tl.minimum(k2_start * 2 // group_size, last_group_idx)
+        scale = tl.load(
+            scale_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
+        zero = tl.load(
+            zero_ptr + group_idx * stride_sg + offs_n * stride_sn, mask=n_mask
+        ).to(tl.float32)
+        # sum_k (q*s + z) * x  =  s * sum_k(q*x)  +  z * sum_k(x)
+        x_tile_sum = tl.sum(x_even + x_odd)
+        acc += (lo_dot + hi_dot) * scale + zero * x_tile_sum
+
+    # Each pid_k owns workspace row pid_k, so no atomics are needed.
+    tl.store(workspace_ptr + pid_k * N + offs_n, acc, mask=n_mask)
+
+
+# ---------------------------------------------------------------------------
 # SPLIT_K reduction kernel
 # ---------------------------------------------------------------------------
 
@@ -556,6 +677,72 @@ def _bf16i4_splitk_reduce(
 # ---------------------------------------------------------------------------
 # Python wrappers
 # ---------------------------------------------------------------------------
+
+
+def _matmul_bf16i4_gemv(
+    x_even: torch.Tensor,
+    x_odd: torch.Tensor,
+    W: torch.Tensor,
+    w_scale_group: torch.Tensor,
+    w_zero_group: torch.Tensor,
+    group_size: int,
+) -> torch.Tensor:
+    """
+    M == 1 path: GEMV kernel over the original [N, K//2] weight, then split-K reduce.
+
+    Args:
+        x_even, x_odd : [K//2]            bfloat16 even/odd K activations
+        W             : [N, K//2]         int8 packed (not pre-transposed)
+        w_scale_group : [num_groups, N]
+        w_zero_group  : [num_groups, N]
+
+    Returns:
+        Y : [1, N]  bfloat16
+    """
+    N, K2 = W.shape
+
+    def grid(meta):
+        return (triton.cdiv(N, meta["BLOCK_N"]), meta["SPLIT_K"])
+
+    # Rows beyond the winning SPLIT_K are never written and never read by the
+    # reduction, so the workspace needs no zeroing.
+    workspace = torch.empty(
+        (_MAX_GEMV_SPLIT_K, N), dtype=torch.float32, device=W.device
+    )
+
+    _bf16i4_gemv_kernel[grid](
+        x_even,
+        x_odd,
+        W,
+        workspace,
+        w_scale_group,
+        w_zero_group,
+        N,
+        K2,
+        group_size,
+        x_even.stride(0),
+        W.stride(0),
+        W.stride(1),
+        w_scale_group.stride(0),
+        w_scale_group.stride(1),
+    )
+
+    split_k = _bf16i4_gemv_kernel.best_config.kwargs["SPLIT_K"]
+
+    # The reduction indexes [SPLIT_K, M, N]; with M == 1 that is the same
+    # memory as the GEMV's [SPLIT_K, N] workspace.
+    Y_bf16 = torch.empty((1, N), dtype=torch.bfloat16, device=W.device)
+    reduce_grid = (1, triton.cdiv(N, 32))
+    _bf16i4_splitk_reduce[reduce_grid](
+        workspace,
+        Y_bf16,
+        1,
+        N,
+        SPLIT_K=split_k,
+        BLOCK_M=32,  # pyre-ignore[6]
+        BLOCK_N=32,  # pyre-ignore[6]
+    )
+    return Y_bf16
 
 
 def matmul_bf16i4_rowwise(
@@ -603,6 +790,14 @@ def matmul_bf16i4_rowwise(
     # than the LDS bank-conflict path the kernel would take doing this internally.
     x_even = X_2d[:, 0::2].contiguous()  # [M, K//2]
     x_odd = X_2d[:, 1::2].contiguous()  # [M, K//2]
+
+    # Dispatch before the transpose cache: the GEMV reads W in its original
+    # layout, so building W_T here would only cost memory and a copy.
+    if M == 1 and _GEMV_ENABLED:
+        Y_bf16 = _matmul_bf16i4_gemv(
+            x_even[0], x_odd[0], W, w_scale_group, w_zero_group, group_size
+        )
+        return Y_bf16.reshape(*leading, N)
 
     # Pre-transpose W from [N, K//2] to [K//2, N] so the kernel loads tiles as
     # [BLOCK_K, BLOCK_N] directly — coalesced along N — without needing tl.trans.

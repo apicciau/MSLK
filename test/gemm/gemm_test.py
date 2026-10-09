@@ -9,6 +9,7 @@
 
 import os
 import unittest
+from unittest import mock
 from typing import Optional, Union
 
 import mslk.gemm  # noqa: F401
@@ -1713,6 +1714,71 @@ class BF16Int4TritonROCmTests(unittest.TestCase):
         y_op = torch.ops.mslk.bf16i4bf16_rowwise(x, wq, w_scale, w_zp)
         y_direct = self.matmul_rowwise(x, wq, w_scale, w_zp)
         torch.testing.assert_close(y_op, y_direct, atol=0.0, rtol=0.0)
+
+    @parameterized.expand(
+        [
+            (256, 256, 128),  # small
+            (1000, 384, 128),  # ragged N; K2=192 leaves trailing split-K slices empty
+            (4096, 4096, 64),  # smallest group: only BLOCK_K=32 survives pruning
+            (4096, 4096, 256),  # large group
+            (13312, 16384, 128),  # Llama-3 405B decode target
+        ]
+    )
+    def test_gemv_matches_dequantized_reference(
+        self,
+        N: int,
+        K: int,
+        group_size: int,
+    ) -> None:
+        """
+        Checks the M == 1 GEMV path against x @ dequant(W).T computed in float32.
+
+        Comparing against the dequantised weights (rather than the unquantised
+        ones) removes the INT4 quantisation error from the reference, so the
+        tolerance only has to cover fp32 summation order and the bf16 output
+        rounding. Odd groups are scaled 16x so that applying one group's scale
+        to another's weights produces an O(1) error.
+        """
+        from mslk.gemm.triton import int4_gemm
+
+        num_groups = K // group_size
+        group_gain = torch.ones(num_groups, device=self.device)
+        group_gain[1::2] = 16.0
+        k_gain = group_gain.repeat_interleave(group_size)
+
+        x = torch.randn(1, K, dtype=torch.bfloat16, device=self.device) * 0.1
+        w = (
+            torch.randn(N, K, dtype=torch.bfloat16, device=self.device)
+            * 0.01
+            * k_gain[None, :]
+        ).to(torch.bfloat16)
+
+        wq_unpacked, w_scale, w_zp = int4_row_quantize(w, group_size)
+        wq = pack_int4(wq_unpacked).contiguous().to(device=self.device)
+        w_scale = w_scale.contiguous().to(device=self.device)
+        w_zp = w_zp.contiguous().to(device=self.device)
+
+        # The transpose cache is keyed by data_ptr(), which the caching allocator
+        # reuses after earlier tests free their weights; start from an empty
+        # cache so the assertion below only sees entries created by this call.
+        with mock.patch.object(int4_gemm, "_GEMV_ENABLED", True), mock.patch.dict(
+            int4_gemm._W_TRANSPOSE_CACHE, clear=True
+        ):
+            y = self.matmul_rowwise(x, wq, w_scale, w_zp)
+            self.assertEqual(
+                len(int4_gemm._W_TRANSPOSE_CACHE),
+                0,
+                "M == 1 should dispatch to the GEMV before building the transposed W",
+            )
+
+        w_dequant = (
+            wq_unpacked.reshape(N, num_groups, group_size).float()
+            * w_scale.T[..., None]
+            + w_zp.T[..., None]
+        ).reshape(N, K)
+        y_ref = (x.float() @ w_dequant.T).to(torch.bfloat16)
+
+        torch.testing.assert_close(y, y_ref, atol=1.0e-2, rtol=1.6e-2)
 
 
 @skipUnlessRocm()
