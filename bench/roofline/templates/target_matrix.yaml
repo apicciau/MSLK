@@ -81,3 +81,26 @@ targets:
       - {M: 16,    N: 8192,  K: 8192,  regime: R3, ceiling_type: hbm_bw, target_pct: 75.0}
       - {M: 1,     N: 8192,  K: 8192,  regime: R3, ceiling_type: hbm_bw, target_pct: 70.0}
       - {M: 4096,  N: 1024,  K: 512,   regime: R4, ceiling_type: empirical_best, target_pct: 95.0}
+
+  # ---- BF16 x INT4 rowwise FlyDSL ----
+  # Pass marks (design D6): HBM-judged shapes >= 50% of empirical HBM bandwidth;
+  # M = 64 and 128 are past the bf16 ridge with INT4 weights (0.5 B per weight),
+  # so they are judged against the bf16 MFMA peak, at least the fraction the
+  # Triton kernel reached on the same node (step-1 profiles); prefill uses the
+  # regime's default floor. Every shape must also be no slower than Triton.
+  - kernel: BF16Int4RowwiseFlyDSL
+    model_source: llama3_405b
+    shapes:
+      # Decode, memory-bound: HBM bandwidth
+      - {M: 1,   N: 13312, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 16,  N: 13312, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 1,   N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 16,  N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      # Decode past the ridge: bf16 MFMA peak
+      - {M: 64,  N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 41.6}
+      - {M: 128, N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 70.3}
+      - {M: 64,  N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 43.4}
+      - {M: 128, N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 68.0}
+      # Prefill: bf16 MFMA peak, regime floor
+      - {M: 2048, N: 16384, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 75.0}
+      - {M: 8192, N: 16384, K: 16384, regime: R1, ceiling_type: mfma_peak, target_pct: 85.0}

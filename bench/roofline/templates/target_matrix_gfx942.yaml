@@ -1,0 +1,37 @@
+# MSLK Target Matrix Template
+# GPU: MI300X (gfx942)
+# Usage: Fill ceiling_value and baseline_achieved_pct after running benchmarks
+gpu_arch: "gfx942"
+tool_version: ""
+timestamp: ""
+measurement_conditions:
+  sclk_mhz: null
+  mclk_mhz: null
+  cache_state: "cold_l2"
+  bench_rep_ms: 200
+  stat_iterations: 5
+  cov_bound_pct: 3.0
+
+targets:
+  # ---- BF16 x INT4 rowwise FlyDSL ----
+  # Pass marks (design D6): HBM-judged shapes >= 50% of empirical HBM bandwidth;
+  # M = 64 and 128 are past the bf16 ridge with INT4 weights (0.5 B per weight),
+  # so they are judged against the bf16 MFMA peak, at least the fraction the
+  # Triton kernel reached on the same node (step-1 profiles); prefill uses the
+  # regime's default floor. Every shape must also be no slower than Triton.
+  - kernel: BF16Int4RowwiseFlyDSL
+    model_source: llama3_405b
+    shapes:
+      # Decode, memory-bound: HBM bandwidth
+      - {M: 1,   N: 13312, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 16,  N: 13312, K: 6656,  regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 1,   N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      - {M: 16,  N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
+      # Decode past the ridge: bf16 MFMA peak
+      - {M: 64,  N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 22.4}
+      - {M: 128, N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 37.5}
+      - {M: 64,  N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 25.1}
+      - {M: 128, N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 31.0}
+      # Prefill: bf16 MFMA peak, regime floor
+      - {M: 2048, N: 16384, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 75.0}
+      - {M: 8192, N: 16384, K: 16384, regime: R1, ceiling_type: mfma_peak, target_pct: 85.0}
