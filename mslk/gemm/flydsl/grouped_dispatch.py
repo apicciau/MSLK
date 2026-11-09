@@ -51,7 +51,7 @@ UNSCALED_DEFAULT_TILE = {**DEFAULT_TILE, "tile_k": 64}
 
 # Candidate tiles swept by autotune. Rowwise scaling allows tile_n below the
 # scale block, which block scaling cannot express, so the two schemes sweep
-# different sets. Tiles that overflow LDS are rejected at compile time.
+# different sets. Tiles that overflow the device's LDS are pruned before tuning.
 _TILE_M = (64, 128, 256)
 _TILE_K = (128, 256)
 
@@ -117,7 +117,48 @@ UNSCALED_TILES = _tiles(
 # axes. When nothing divides, which is the case that needs the padding,
 # prune_by_divisibility falls back to the full list and the shape still gets
 # tuned.
-_PRUNE = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
+_prune_by_divisibility = prune_by_divisibility({"tile_n": "n", "tile_k": "k"})
+
+
+def _fits_lds(config, named_args):
+    # The same budget the kernel factory enforces before tracing, so a candidate
+    # dropped here is one that would only have been rejected there. Imported
+    # lazily because pruning only runs under the FlyDSL autotuner, and the
+    # kernel modules pull in the FlyDSL compiler.
+    from flydsl.runtime.device import get_rocm_arch
+    from mslk.flydsl.kernels.gemm.fp8_grouped_gemm_common import (
+        ELEM_BYTES,
+        validate_lds_budget_plain,
+        validate_lds_budget_preshuffle,
+    )
+
+    validate_lds_budget = (
+        validate_lds_budget_preshuffle
+        if named_args["b_preshuffled"]
+        else validate_lds_budget_plain
+    )
+    try:
+        validate_lds_budget(
+            tile_m=config.kwargs["tile_m"],
+            tile_n=config.kwargs["tile_n"],
+            tile_k=config.kwargs["tile_k"],
+            elem_bytes=ELEM_BYTES[named_args["in_dtype"]],
+            arch=get_rocm_arch(),
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _prune_tiles(configs, named_args, **kwargs):
+    # LDS capacity is per arch (64 KiB on gfx942, 160 KiB on gfx950) while the
+    # candidate lists are shared, so without this each over-budget tile costs a
+    # failed attempt per tuned key. If none fit, the full list goes through and
+    # the kernel factory's error names the budget.
+    fitting = [c for c in configs if _fits_lds(c, named_args)]
+    return _prune_by_divisibility(fitting or list(configs), named_args, **kwargs)
+
+
 # roll_k is deliberately absent: it is fixed policy rather than something that
 # varies per call, and a tuning space containing a fully unrolled candidate would
 # have to compile one per tile config, at a cost that grows with K.
@@ -386,13 +427,13 @@ def launch(
 # Each scaling scheme sweeps a different tile set, so each gets its own tuned
 # entry point; the cache key carries the scheme as well, since the kernels differ.
 _launch_blockscale = tunable(
-    configs=BLOCKSCALE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+    configs=BLOCKSCALE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_prune_tiles
 )(launch)
 _launch_rowwise = tunable(
-    configs=ROWWISE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_PRUNE
+    configs=ROWWISE_TILES, default=DEFAULT_TILE, key=_KEY, prune=_prune_tiles
 )(launch)
 _launch_unscaled = tunable(
-    configs=UNSCALED_TILES, default=UNSCALED_DEFAULT_TILE, key=_KEY, prune=_PRUNE
+    configs=UNSCALED_TILES, default=UNSCALED_DEFAULT_TILE, key=_KEY, prune=_prune_tiles
 )(launch)
 
 
