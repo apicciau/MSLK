@@ -25,8 +25,9 @@ import triton
 from mslk.bench.gemm.gemm_bench import _COMPUTE_DTYPE_TO_ROOFLINE_KEY
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, get_gemm_ops
 from mslk.bench.roofline.capture import EmpiricalRoofline, load_empirical_roofline
-from mslk.bench.roofline.regime import CeilingType, classify_regime
+from mslk.bench.roofline.regime import CeilingType
 from mslk.bench.roofline.targets import (
+    classify_with_target,
     load_target_matrix,
     lookup_target,
     save_target_matrix,
@@ -133,8 +134,8 @@ def bench_gemm_op(
     tflops = 2 * M * N * K / (median_ms / 1e3) / 1e12
     gbps = moved_bytes(gemm_op, quantized, output) / (median_ms / 1e3) / 1e9
 
-    # Regime classification
-    rc = classify_regime(M, N, K)
+    # Regime, ceiling and pass mark: the target row's if the matrix has one.
+    rc, _target = classify_with_target(target_matrix, kernel_name, M, N, K)
 
     # Ceiling and achieved %
     ceiling_value = 0.0
@@ -149,13 +150,8 @@ def bench_gemm_op(
             ceiling_value = triton.testing.get_dram_gbps()
         achieved_pct = (gbps / ceiling_value) * 100 if ceiling_value > 0 else 0
 
-    # Target
     target_pct = rc.target_low
     target_pass = None
-    if target_matrix:
-        t = lookup_target(target_matrix, kernel_name, M, N, K)
-        if t:
-            target_pct = t.target_pct
     if achieved_pct > 0:
         target_pass = achieved_pct >= target_pct
 

@@ -24,8 +24,12 @@ from mslk.bench.common.telemetry import export_benchmark_to_scuba, is_scuba_avai
 from mslk.bench.common.utils import BenchOptions, common_bench_options, profiler
 from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, GemmType, get_gemm_ops
 from mslk.bench.roofline.capture import EmpiricalRoofline, load_empirical_roofline
-from mslk.bench.roofline.regime import CeilingType, classify_regime
-from mslk.bench.roofline.targets import load_target_matrix, lookup_target, TargetMatrix
+from mslk.bench.roofline.regime import CeilingType
+from mslk.bench.roofline.targets import (
+    classify_with_target,
+    load_target_matrix,
+    TargetMatrix,
+)
 from mslk.utils.device import get_gfx_arch_name
 from tabulate import tabulate
 
@@ -407,16 +411,12 @@ def _enrich_metrics_with_regime(
     num_groups: int | None = None,
 ) -> None:
     """Add regime, ceiling, achieved percentage, and target result to metrics."""
-    rc = classify_regime(m, n, k, is_grouped, num_groups)
+    rc, target = classify_with_target(
+        _target_matrix, metrics.op, m, n, k, is_grouped, num_groups
+    )
     metrics.regime = rc.regime.value
     metrics.ceiling_type = rc.ceiling_type.value
     metrics.target_pct = rc.target_low
-
-    target = None
-    if _target_matrix is not None:
-        target = lookup_target(_target_matrix, metrics.op, m, n, k)
-        if target is not None:
-            metrics.target_pct = target.target_pct
 
     if rc.ceiling_type == CeilingType.MFMA_PEAK and compute_roofline_tflops:
         metrics.ceiling_value = compute_roofline_tflops

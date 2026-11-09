@@ -4,12 +4,17 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 import yaml
-from mslk.bench.roofline.regime import classify_regime
+from mslk.bench.roofline.regime import (
+    CeilingType,
+    classify_regime,
+    Regime,
+    RegimeClassification,
+)
 
 
 @dataclass
@@ -147,3 +152,35 @@ def lookup_target(
         if t.kernel_name == kernel_name and t.M == M and t.N == N and t.K == K:
             return t
     return None
+
+
+def classify_with_target(
+    matrix: Optional[TargetMatrix],
+    kernel_name: str,
+    M: int,
+    N: int,
+    K: int,
+    is_grouped: bool = False,
+    num_groups: int | None = None,
+) -> tuple[RegimeClassification, Optional[KernelTarget]]:
+    """The shape's regime, ceiling and pass mark, and its target row if any.
+
+    A target row overrides classify_regime: it records the regime and ceiling
+    chosen for that kernel and shape, which the shape-only rule cannot see (an
+    INT4-weight decode GEMM at M = 128 is past the ridge, so it is judged against
+    the MFMA peak although M <= 128). Without a row, classify_regime decides.
+    """
+    classification = classify_regime(M, N, K, is_grouped, num_groups)
+    target = None
+    if matrix is not None:
+        target = lookup_target(matrix, kernel_name, M, N, K)
+    if target is None:
+        return classification, None
+    from_row = replace(
+        classification,
+        regime=Regime(target.regime),
+        ceiling_type=CeilingType(target.ceiling_type),
+        target_low=target.target_pct,
+        rationale=f"target row: {target.regime}, {target.ceiling_type}",
+    )
+    return from_row, target
