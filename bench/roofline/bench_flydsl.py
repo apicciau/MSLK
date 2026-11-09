@@ -5,10 +5,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Standalone FlyDSL preshuffle GEMM benchmark for WP-1a roofline profiling.
+"""FlyDSL GEMM benchmark for roofline profiling.
 
-Bypasses the full gemm_ops registry (which requires the C++ .so) and directly
-benchmarks the FlyDSL preshuffle kernel against empirical roofline ceilings.
+Times one registered gemm_ops class (--kernel) per shape against empirical
+roofline ceilings and the target matrix. Needs the full MSLK build, because
+gemm_ops loads the C++ ops library.
 """
 
 import os
@@ -21,6 +22,8 @@ import numpy as np
 import pandas as pd
 import torch
 import triton
+from mslk.bench.gemm.gemm_bench import _COMPUTE_DTYPE_TO_ROOFLINE_KEY
+from mslk.bench.gemm.gemm_ops import ComputeDtype, GemmOpBase, get_gemm_ops
 from mslk.bench.roofline.capture import EmpiricalRoofline, load_empirical_roofline
 from mslk.bench.roofline.regime import CeilingType, classify_regime
 from mslk.bench.roofline.targets import (
@@ -29,15 +32,44 @@ from mslk.bench.roofline.targets import (
     save_target_matrix,
     TargetMatrix,
 )
-from mslk.utils.device import supports_float8_fnuz
+
+# MFMA peaks used when the roofline JSON has none for the op's compute dtype.
+# Dtypes absent here require --roofline-json.
+DATASHEET_MFMA_PEAK_TFLOPS = {ComputeDtype.FP8: 4600.0}
 
 
-def _quantize_fp8_row(x: torch.Tensor):
-    fp8_dtype = torch.float8_e4m3fnuz if supports_float8_fnuz() else torch.float8_e4m3fn
-    xmax = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
-    scale = xmax / torch.finfo(fp8_dtype).max
-    xq = (x / scale).to(fp8_dtype)
-    return xq, scale.squeeze(-1)
+def find_gemm_op(class_name: str) -> GemmOpBase:
+    ops_by_class_name = {type(op).__name__: op for op in get_gemm_ops()}
+    if class_name not in ops_by_class_name:
+        raise click.BadParameter(f"no registered gemm_ops class {class_name}")
+    return ops_by_class_name[class_name]
+
+
+def mfma_peak_tflops(
+    compute_dtype: ComputeDtype, roofline: Optional[EmpiricalRoofline]
+) -> float:
+    roofline_key = _COMPUTE_DTYPE_TO_ROOFLINE_KEY[compute_dtype]
+    if roofline and roofline_key in roofline.mfma_peak_tflops:
+        return roofline.mfma_peak_tflops[roofline_key]
+    if compute_dtype in DATASHEET_MFMA_PEAK_TFLOPS:
+        return DATASHEET_MFMA_PEAK_TFLOPS[compute_dtype]
+    raise ValueError(f"roofline JSON has no '{roofline_key}' MFMA peak")
+
+
+def tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+def moved_bytes(gemm_op: GemmOpBase, quantized: tuple, output: torch.Tensor) -> int:
+    """Activation, weight and output bytes, as gemm_bench counts them. FP8 also
+    counts its two row-scale vectors, keeping the existing FP8 baselines
+    comparable."""
+    activation, weight = quantized[0], quantized[1]
+    total = tensor_bytes(activation) + tensor_bytes(weight) + tensor_bytes(output)
+    if gemm_op.compute_dtype == ComputeDtype.FP8:
+        activation_scale, weight_scale = quantized[2], quantized[3]
+        total += tensor_bytes(activation_scale) + tensor_bytes(weight_scale)
+    return total
 
 
 @dataclass
@@ -60,7 +92,8 @@ class BenchResult:
     n_iters: int
 
 
-def bench_flydsl_preshuffle(
+def bench_gemm_op(
+    gemm_op: GemmOpBase,
     M: int,
     N: int,
     K: int,
@@ -70,34 +103,25 @@ def bench_flydsl_preshuffle(
     rep_ms: int = 200,
     device: int = 0,
 ) -> BenchResult:
-    """Benchmark FlyDSL preshuffle GEMM for a single shape."""
-    # Keep this optional kernel import out of report-only command startup.
-    from mslk.gemm.flydsl.preshuffle_gemm import (
-        flydsl_preshuffle,
-        flydsl_preshuffle_gemm,
-    )
-
+    """Benchmark one gemm_ops class for a single shape."""
     torch.cuda.set_device(device)
+    kernel_name = type(gemm_op).__name__
 
     A = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
     B = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
 
-    xq, x_scale = _quantize_fp8_row(A)
-    wq, w_scale = _quantize_fp8_row(B)
-    wq_shuffled = flydsl_preshuffle(wq)
+    # Same preparation order as gemm_bench.benchmark.
+    quantized = gemm_op.quantize(*gemm_op.preprocess(A, B))
 
     # Warmup
     for _ in range(3):
-        flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale)
+        output = gemm_op.compute(*quantized)
     torch.cuda.synchronize()
 
     # Benchmark N iterations
     timings = []
     for _ in range(n_iterations):
-        ms = triton.testing.do_bench(
-            lambda: flydsl_preshuffle_gemm(xq, wq_shuffled, x_scale, w_scale),
-            rep=rep_ms,
-        )
+        ms = triton.testing.do_bench(lambda: gemm_op.compute(*quantized), rep=rep_ms)
         timings.append(ms)
 
     arr = np.array(timings)
@@ -107,13 +131,7 @@ def bench_flydsl_preshuffle(
     cov_pct = (std_ms / mean_ms * 100) if mean_ms > 0 else 0.0
 
     tflops = 2 * M * N * K / (median_ms / 1e3) / 1e12
-    input_bytes = xq.numel() + wq_shuffled.numel()  # FP8 = 1 byte each
-    output_bytes = M * N * 2  # BF16 output = 2 bytes
-    scale_bytes = (
-        x_scale.numel() * x_scale.element_size()
-        + w_scale.numel() * w_scale.element_size()
-    )
-    gbps = (input_bytes + output_bytes + scale_bytes) / (median_ms / 1e3) / 1e9
+    gbps = moved_bytes(gemm_op, quantized, output) / (median_ms / 1e3) / 1e9
 
     # Regime classification
     rc = classify_regime(M, N, K)
@@ -122,10 +140,7 @@ def bench_flydsl_preshuffle(
     ceiling_value = 0.0
     achieved_pct = 0.0
     if rc.ceiling_type == CeilingType.MFMA_PEAK:
-        if roofline and "fp8" in roofline.mfma_peak_tflops:
-            ceiling_value = roofline.mfma_peak_tflops["fp8"]
-        else:
-            ceiling_value = 4600.0  # datasheet fallback
+        ceiling_value = mfma_peak_tflops(gemm_op.compute_dtype, roofline)
         achieved_pct = (tflops / ceiling_value) * 100 if ceiling_value > 0 else 0
     elif rc.ceiling_type == CeilingType.HBM_BW:
         if roofline and roofline.hbm_bw_gbps > 0:
@@ -138,14 +153,14 @@ def bench_flydsl_preshuffle(
     target_pct = rc.target_low
     target_pass = None
     if target_matrix:
-        t = lookup_target(target_matrix, "FP8RowwisePreshuffleFlyDSL", M, N, K)
+        t = lookup_target(target_matrix, kernel_name, M, N, K)
         if t:
             target_pct = t.target_pct
     if achieved_pct > 0:
         target_pass = achieved_pct >= target_pct
 
     return BenchResult(
-        kernel="FP8RowwisePreshuffleFlyDSL",
+        kernel=kernel_name,
         M=M,
         N=N,
         K=K,
@@ -165,6 +180,12 @@ def bench_flydsl_preshuffle(
 
 
 @click.command()
+@click.option(
+    "--kernel",
+    "kernel_class_name",
+    default="FP8RowwisePreshuffleFlyDSL",
+    help="gemm_ops class to benchmark, e.g. BF16Int4RowwiseFlyDSL",
+)
 @click.option("--roofline-json", default=None, type=click.Path(exists=True))
 @click.option("--target-template", default=None, type=click.Path(exists=True))
 @click.option("--output-dir", default="/tmp/mslk_flydsl_bench")
@@ -179,6 +200,7 @@ def bench_flydsl_preshuffle(
     help="Preset: llama3_70b, llama3_405b, roofline_validation",
 )
 def main(
+    kernel_class_name,
     roofline_json,
     target_template,
     output_dir,
@@ -189,6 +211,16 @@ def main(
     device,
     shapes,
 ):
+    gemm_op = find_gemm_op(kernel_class_name)
+    if not gemm_op.supported:
+        raise click.UsageError(f"{kernel_class_name} is not supported on this device")
+    if (
+        roofline_json is None
+        and gemm_op.compute_dtype not in DATASHEET_MFMA_PEAK_TFLOPS
+    ):
+        raise click.UsageError(
+            f"{kernel_class_name} has no datasheet MFMA peak: pass --roofline-json"
+        )
     os.makedirs(output_dir, exist_ok=True)
 
     roofline = load_empirical_roofline(roofline_json) if roofline_json else None
@@ -221,9 +253,10 @@ def main(
         shape_list = [(m, n, k) for m in Ms for n in Ns for k in Ks]
 
     if roofline:
-        fp8_peak = roofline.mfma_peak_tflops.get("fp8", 0)
+        roofline_key = _COMPUTE_DTYPE_TO_ROOFLINE_KEY[gemm_op.compute_dtype]
+        peak = roofline.mfma_peak_tflops.get(roofline_key, 0)
         print(
-            f"Empirical roofline: FP8 MFMA={fp8_peak:.1f} TFLOPS, "
+            f"Empirical roofline: {roofline_key.upper()} MFMA={peak:.1f} TFLOPS, "
             f"HBM={roofline.hbm_bw_gbps:.1f} GB/s"
         )
     shape_count = len(shape_list)
@@ -239,7 +272,8 @@ def main(
     results = []
     for M, N, K in shape_list:
         try:
-            r = bench_flydsl_preshuffle(
+            r = bench_gemm_op(
+                gemm_op,
                 M,
                 N,
                 K,
@@ -260,7 +294,7 @@ def main(
                 f"{pass_str:<5} {r.cov_pct:<7.2f}"
             )
             results.append(r)
-        except RuntimeError as error:
+        except (RuntimeError, ValueError) as error:
             print(f"({M},{N},{K}) FAILED: {error}")
 
     # Export CSV
