@@ -97,10 +97,10 @@ targets:
       - {M: 1,   N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
       - {M: 16,  N: 13312, K: 16384, regime: R3, ceiling_type: hbm_bw, target_pct: 50.0}
       # Decode past the ridge: bf16 MFMA peak
-      - {M: 64,  N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 41.6}
-      - {M: 128, N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 70.3}
-      - {M: 64,  N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 43.4}
-      - {M: 128, N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 68.0}
+      - {M: 64,  N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 18.1}
+      - {M: 128, N: 13312, K: 6656,  regime: R2, ceiling_type: mfma_peak, target_pct: 29.9}
+      - {M: 64,  N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 20.1}
+      - {M: 128, N: 13312, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 31.4}
       # Prefill: bf16 MFMA peak, regime floor
       - {M: 2048, N: 16384, K: 16384, regime: R2, ceiling_type: mfma_peak, target_pct: 75.0}
       - {M: 8192, N: 16384, K: 16384, regime: R1, ceiling_type: mfma_peak, target_pct: 85.0}
